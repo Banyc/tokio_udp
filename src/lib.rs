@@ -32,6 +32,12 @@ mod imp {
         inner: AsyncFd<socket2::Socket>,
     }
 
+    impl std::fmt::Debug for UdpSocket {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("UdpSocket").finish()
+        }
+    }
+
     impl UdpSocket {
         pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
             let domain = match addr {
@@ -205,6 +211,99 @@ mod imp {
         pub async fn writable(&self) -> io::Result<()> {
             self.inner.writable().await.map(|_| ())
         }
+
+        /// Attempt a non-blocking send. Returns `WouldBlock` if the kernel
+        /// buffer is full.
+        pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+            // socket2's Socket is set to non-blocking, so send returns
+            // WouldBlock when the buffer is full.
+            self.inner.get_ref().send(buf)
+        }
+
+        /// Attempt a non-blocking send to a target address.
+        pub fn try_send_to(&self, buf: &[u8], target: &SocketAddr) -> io::Result<usize> {
+            let addr = SockAddr::from(*target);
+            self.inner.get_ref().send_to(buf, &addr)
+        }
+
+        /// Attempt a non-blocking receive. Returns `WouldBlock` if no data
+        /// is available.
+        pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            let buf: &mut [MaybeUninit<u8>] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    buf.as_mut_ptr() as *mut MaybeUninit<u8>,
+                    buf.len(),
+                )
+            };
+            self.inner.get_ref().recv(buf)
+        }
+
+        fn poll_recv_buf(
+            &self,
+            cx: &mut Context<'_>,
+            dst: &mut bytes::buf::UninitSlice,
+        ) -> Poll<io::Result<usize>> {
+            let buf: &mut [MaybeUninit<u8>] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    dst.as_mut_ptr() as *mut MaybeUninit<u8>,
+                    dst.len(),
+                )
+            };
+            loop {
+                match self.inner.get_ref().recv(buf) {
+                    Ok(n) => return Poll::Ready(Ok(n)),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+                ready!(self.inner.poll_read_ready(cx))?.clear_ready();
+            }
+        }
+
+        fn poll_recv_buf_from(
+            &self,
+            cx: &mut Context<'_>,
+            dst: &mut bytes::buf::UninitSlice,
+        ) -> Poll<io::Result<(usize, SockAddr)>> {
+            let buf: &mut [MaybeUninit<u8>] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    dst.as_mut_ptr() as *mut MaybeUninit<u8>,
+                    dst.len(),
+                )
+            };
+            loop {
+                match self.inner.get_ref().recv_from(buf) {
+                    Ok((n, addr)) => return Poll::Ready(Ok((n, addr))),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+                ready!(self.inner.poll_read_ready(cx))?.clear_ready();
+            }
+        }
+
+        /// Receive into a `BufMut` (vectored bytes buffer). Returns the
+        /// number of bytes read.
+        pub async fn recv_buf(&self, buf: &mut impl bytes::BufMut) -> io::Result<usize> {
+            let dst = buf.chunk_mut();
+            let n = std::future::poll_fn(|cx| self.poll_recv_buf(cx, dst)).await?;
+            // SAFETY: `n` bytes were written by the kernel into `dst`.
+            unsafe { buf.advance_mut(n); }
+            Ok(n)
+        }
+
+        /// Receive from any peer into a `BufMut`.
+        pub async fn recv_buf_from(
+            &self,
+            buf: &mut impl bytes::BufMut,
+        ) -> io::Result<(usize, SocketAddr)> {
+            let dst = buf.chunk_mut();
+            let (n, addr) = std::future::poll_fn(|cx| self.poll_recv_buf_from(cx, dst)).await?;
+            // SAFETY: `n` bytes were written by the kernel into `dst`.
+            unsafe { buf.advance_mut(n); }
+            let addr = addr
+                .as_socket()
+                .ok_or_else(|| io::Error::other("failed to convert source address"))?;
+            Ok((n, addr))
+        }
     }
 
     unsafe impl Send for UdpSocket {}
@@ -222,6 +321,12 @@ mod imp {
 
     pub struct UdpSocket {
         inner: tokio::net::UdpSocket,
+    }
+
+    impl std::fmt::Debug for UdpSocket {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("UdpSocket").finish()
+        }
     }
 
     impl UdpSocket {
@@ -302,6 +407,29 @@ mod imp {
 
         pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
             self.inner.recv_from(buf).await
+        }
+
+        pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.try_send(buf)
+        }
+
+        pub fn try_send_to(&self, buf: &[u8], target: &SocketAddr) -> io::Result<usize> {
+            self.inner.try_send_to(buf, target)
+        }
+
+        pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.try_recv(buf)
+        }
+
+        pub async fn recv_buf(&self, buf: &mut impl bytes::BufMut) -> io::Result<usize> {
+            self.inner.recv_buf(buf).await
+        }
+
+        pub async fn recv_buf_from(
+            &self,
+            buf: &mut impl bytes::BufMut,
+        ) -> io::Result<(usize, SocketAddr)> {
+            self.inner.recv_buf_from(buf).await
         }
     }
 

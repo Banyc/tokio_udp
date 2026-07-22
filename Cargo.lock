@@ -110,6 +110,7 @@ dependencies = [
 name = "tokio_udp"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "socket2 0.5.10",
  "tokio",
 ]
