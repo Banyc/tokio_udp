@@ -1,171 +1,334 @@
-use std::io::{self, IoSlice};
-use std::mem::MaybeUninit;
-use std::net::SocketAddr;
-use std::task::{ready, Context, Poll};
+//! A tokio-integrated UDP socket with zero-copy vectored sends via
+//! `sendmsg(2)` on Unix, and a `tokio::net::UdpSocket` fallback on
+//! non-Unix (Windows).
 
-use socket2::{MsgHdr, SockAddr};
-use tokio::io::unix::AsyncFd;
+// ---------------------------------------------------------------------------
+// Cross-platform public API
+// ---------------------------------------------------------------------------
 
-/// A UDP socket integrated with tokio's async reactor that supports true
-/// zero-copy vectored sends via `sendmsg(2)`.
+/// A tokio-integrated UDP socket.
 ///
-/// Where [`tokio::net::UdpSocket`] only accepts a single `&[u8]` per send,
-/// this wrapper lets callers pass multiple `IoSlice` segments directly to
-/// the kernel via `sendmsg`, avoiding intermediate concatenation.
-pub struct UdpSocket {
-    inner: AsyncFd<socket2::Socket>,
-}
+/// On Unix the socket is backed by `socket2::Socket` + `AsyncFd` and uses
+/// `sendmsg(2)` for zero-copy vectored sends. On other platforms it wraps
+/// `tokio::net::UdpSocket` and falls back to concatenation for vectored
+/// sends.
+pub use imp::UdpSocket;
 
-impl UdpSocket {
-    /// Create a new UDP socket bound to `addr`.
-    pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
-        let domain = match addr {
-            SocketAddr::V4(_) => socket2::Domain::IPV4,
-            SocketAddr::V6(_) => socket2::Domain::IPV6,
-        };
-        let socket =
-            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-        socket.set_nonblocking(true)?;
-        socket.bind(&SockAddr::from(addr))?;
-        let inner = AsyncFd::new(socket)?;
-        Ok(Self { inner })
+// ---------------------------------------------------------------------------
+// Unix implementation — sendmsg(2) via socket2::Socket + AsyncFd
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod imp {
+    use std::io::{self, IoSlice};
+    use std::mem::MaybeUninit;
+    use std::net::SocketAddr;
+    use std::task::{ready, Context, Poll};
+
+    use socket2::{MsgHdr, SockAddr};
+    use tokio::io::unix::AsyncFd;
+
+    pub struct UdpSocket {
+        inner: AsyncFd<socket2::Socket>,
     }
 
-    /// Return the local address this socket is bound to.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner
-            .get_ref()
-            .local_addr()?
-            .as_socket()
-            .ok_or_else(|| io::Error::other("failed to convert socket address"))
-    }
-
-    /// Connect the socket to a remote peer.
-    pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        self.inner.get_ref().connect(&SockAddr::from(addr))
-    }
-
-    /// Return the peer address if the socket is connected.
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.inner
-            .get_ref()
-            .peer_addr()?
-            .as_socket()
-            .ok_or_else(|| io::Error::other("failed to convert peer address"))
-    }
-
-    // ── low-level poll methods ──────────────────────────────────────
-
-    fn poll_send_vectored(
-        &self,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-        target: Option<&SockAddr>,
-    ) -> Poll<io::Result<usize>> {
-        loop {
-            let msg = match target {
-                Some(addr) => MsgHdr::new().with_addr(addr).with_buffers(bufs),
-                None => MsgHdr::new().with_buffers(bufs),
+    impl UdpSocket {
+        pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
+            let domain = match addr {
+                SocketAddr::V4(_) => socket2::Domain::IPV4,
+                SocketAddr::V6(_) => socket2::Domain::IPV6,
             };
-            match self.inner.get_ref().sendmsg(&msg, 0) {
-                Ok(n) => return Poll::Ready(Ok(n)),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Poll::Ready(Err(e)),
+            let socket = socket2::Socket::new(
+                domain,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            socket.set_nonblocking(true)?;
+            socket.bind(&SockAddr::from(addr))?;
+            let inner = AsyncFd::new(socket)?;
+            Ok(Self { inner })
+        }
+
+        pub fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner
+                .get_ref()
+                .local_addr()?
+                .as_socket()
+                .ok_or_else(|| io::Error::other("failed to convert socket address"))
+        }
+
+        pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+            self.inner
+                .get_ref()
+                .peer_addr()?
+                .as_socket()
+                .ok_or_else(|| io::Error::other("failed to convert peer address"))
+        }
+
+        pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+            self.inner.get_ref().connect(&SockAddr::from(addr))
+        }
+
+        pub fn set_broadcast(&self, on: bool) -> io::Result<()> {
+            self.inner.get_ref().set_broadcast(on)
+        }
+
+        pub fn broadcast(&self) -> io::Result<bool> {
+            self.inner.get_ref().broadcast()
+        }
+
+        pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+            self.inner.get_ref().set_ttl(ttl)
+        }
+
+        pub fn ttl(&self) -> io::Result<u32> {
+            self.inner.get_ref().ttl()
+        }
+
+        pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
+            self.inner.get_ref().set_multicast_loop_v4(on)
+        }
+
+        pub fn join_multicast_v4(&self, multi_addr: &std::net::Ipv4Addr, interface: &std::net::Ipv4Addr) -> io::Result<()> {
+            self.inner
+                .get_ref()
+                .join_multicast_v4(multi_addr, interface)
+        }
+
+        pub fn leave_multicast_v4(&self, multi_addr: &std::net::Ipv4Addr, interface: &std::net::Ipv4Addr) -> io::Result<()> {
+            self.inner
+                .get_ref()
+                .leave_multicast_v4(multi_addr, interface)
+        }
+
+        /// Low-level [`AsyncFd`] access for registering custom readiness
+        /// interests.
+        pub fn async_fd(&self) -> &AsyncFd<socket2::Socket> {
+            &self.inner
+        }
+
+        fn poll_send_vectored(
+            &self,
+            cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+            target: Option<&SockAddr>,
+        ) -> Poll<io::Result<usize>> {
+            loop {
+                let msg = match target {
+                    Some(addr) => MsgHdr::new().with_addr(addr).with_buffers(bufs),
+                    None => MsgHdr::new().with_buffers(bufs),
+                };
+                match self.inner.get_ref().sendmsg(&msg, 0) {
+                    Ok(n) => return Poll::Ready(Ok(n)),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+                ready!(self.inner.poll_write_ready(cx))?.clear_ready();
             }
-            ready!(self.inner.poll_write_ready(cx))?.clear_ready();
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(
+                    buf.as_mut_ptr() as *mut MaybeUninit<u8>,
+                    buf.len(),
+                )
+            };
+            loop {
+                match self.inner.get_ref().recv(buf) {
+                    Ok(n) => return Poll::Ready(Ok(n)),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+                ready!(self.inner.poll_read_ready(cx))?.clear_ready();
+            }
+        }
+
+        fn poll_recv_from(
+            &self,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<(usize, SockAddr)>> {
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(
+                    buf.as_mut_ptr() as *mut MaybeUninit<u8>,
+                    buf.len(),
+                )
+            };
+            loop {
+                match self.inner.get_ref().recv_from(buf) {
+                    Ok((n, addr)) => return Poll::Ready(Ok((n, addr))),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+                ready!(self.inner.poll_read_ready(cx))?.clear_ready();
+            }
+        }
+
+        pub async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+            std::future::poll_fn(|cx| self.poll_send_vectored(cx, bufs, None)).await
+        }
+
+        pub async fn send_to_vectored(
+            &self,
+            bufs: &[IoSlice<'_>],
+            target: &SocketAddr,
+        ) -> io::Result<usize> {
+            let addr = SockAddr::from(*target);
+            std::future::poll_fn(|cx| self.poll_send_vectored(cx, bufs, Some(&addr))).await
+        }
+
+        pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+            self.send_vectored(&[IoSlice::new(buf)]).await
+        }
+
+        pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            std::future::poll_fn(|cx| self.poll_recv(cx, buf)).await
+        }
+
+        pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            let (n, addr) = std::future::poll_fn(|cx| self.poll_recv_from(cx, buf)).await?;
+            let addr = addr
+                .as_socket()
+                .ok_or_else(|| io::Error::other("failed to convert source address"))?;
+            Ok((n, addr))
+        }
+
+        pub async fn readable(&self) -> io::Result<()> {
+            self.inner.readable().await.map(|_| ())
+        }
+
+        pub async fn writable(&self) -> io::Result<()> {
+            self.inner.writable().await.map(|_| ())
         }
     }
 
-    fn poll_recv(
-        &self,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        // SAFETY: MaybeUninit<u8> has the same layout as u8, so reinterpreting
-        // a &mut [u8] as &mut [MaybeUninit<u8>] is valid. The recv system call
-        // will write initialized bytes into it.
-        let buf = unsafe {
-            std::slice::from_raw_parts_mut(
-                buf.as_mut_ptr() as *mut MaybeUninit<u8>,
-                buf.len(),
-            )
-        };
-        loop {
-            match self.inner.get_ref().recv(buf) {
-                Ok(n) => return Poll::Ready(Ok(n)),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-            ready!(self.inner.poll_read_ready(cx))?.clear_ready();
-        }
-    }
-
-    fn poll_recv_from(
-        &self,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<(usize, SockAddr)>> {
-        let buf = unsafe {
-            std::slice::from_raw_parts_mut(
-                buf.as_mut_ptr() as *mut MaybeUninit<u8>,
-                buf.len(),
-            )
-        };
-        loop {
-            match self.inner.get_ref().recv_from(buf) {
-                Ok((n, addr)) => return Poll::Ready(Ok((n, addr))),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-            ready!(self.inner.poll_read_ready(cx))?.clear_ready();
-        }
-    }
-
-    // ── async public API ────────────────────────────────────────────
-
-    /// Send data to the connected peer from multiple buffers via
-    /// `sendmsg(2)`. The socket must be connected.
-    pub async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        std::future::poll_fn(|cx| self.poll_send_vectored(cx, bufs, None)).await
-    }
-
-    /// Send data to `target` from multiple buffers via `sendmsg(2)`.
-    pub async fn send_to_vectored(
-        &self,
-        bufs: &[IoSlice<'_>],
-        target: &SocketAddr,
-    ) -> io::Result<usize> {
-        let addr = SockAddr::from(*target);
-        std::future::poll_fn(|cx| self.poll_send_vectored(cx, bufs, Some(&addr))).await
-    }
-
-    /// Convenience: send a single buffer to the connected peer.
-    pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.send_vectored(&[IoSlice::new(buf)]).await
-    }
-
-    /// Receive from the connected peer into a single buffer.
-    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        std::future::poll_fn(|cx| self.poll_recv(cx, buf)).await
-    }
-
-    /// Receive from any peer (unconnected socket).
-    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let (n, addr) = std::future::poll_fn(|cx| self.poll_recv_from(cx, buf)).await?;
-        let addr = addr
-            .as_socket()
-            .ok_or_else(|| io::Error::other("failed to convert source address"))?;
-        Ok((n, addr))
-    }
+    unsafe impl Send for UdpSocket {}
+    unsafe impl Sync for UdpSocket {}
 }
 
-// SAFETY: socket2::Socket wraps a raw fd, which is Send + Sync.
-unsafe impl Send for UdpSocket {}
-unsafe impl Sync for UdpSocket {}
+// ---------------------------------------------------------------------------
+// Non-Unix implementation — tokio::net::UdpSocket + concatenation fallback
+// ---------------------------------------------------------------------------
+
+#[cfg(not(unix))]
+mod imp {
+    use std::io::{self, IoSlice};
+    use std::net::SocketAddr;
+
+    pub struct UdpSocket {
+        inner: tokio::net::UdpSocket,
+    }
+
+    impl UdpSocket {
+        pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
+            let inner = tokio::net::UdpSocket::bind(addr).await?;
+            Ok(Self { inner })
+        }
+
+        pub fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.peer_addr()
+        }
+
+        pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+            self.inner.connect(addr).into()
+        }
+
+        pub fn set_broadcast(&self, on: bool) -> io::Result<()> {
+            self.inner.set_broadcast(on)
+        }
+
+        pub fn broadcast(&self) -> io::Result<bool> {
+            self.inner.broadcast()
+        }
+
+        pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+            self.inner.set_ttl(ttl)
+        }
+
+        pub fn ttl(&self) -> io::Result<u32> {
+            self.inner.ttl()
+        }
+
+        pub async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+            match bufs.len() {
+                0 => Ok(0),
+                1 => self.inner.send(&bufs[0]).await,
+                _ => {
+                    let total: usize = bufs.iter().map(|b| b.len()).sum();
+                    let mut buf = Vec::with_capacity(total);
+                    for b in bufs {
+                        buf.extend_from_slice(b);
+                    }
+                    self.inner.send(&buf).await
+                }
+            }
+        }
+
+        pub async fn send_to_vectored(
+            &self,
+            bufs: &[IoSlice<'_>],
+            target: &SocketAddr,
+        ) -> io::Result<usize> {
+            match bufs.len() {
+                0 => Ok(0),
+                1 => self.inner.send_to(&bufs[0], target).await,
+                _ => {
+                    let total: usize = bufs.iter().map(|b| b.len()).sum();
+                    let mut buf = Vec::with_capacity(total);
+                    for b in bufs {
+                        buf.extend_from_slice(b);
+                    }
+                    self.inner.send_to(&buf, target).await
+                }
+            }
+        }
+
+        pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.send(buf).await
+        }
+
+        pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.recv(buf).await
+        }
+
+        pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            self.inner.recv_from(buf).await
+        }
+    }
+
+    unsafe impl Send for UdpSocket {}
+    unsafe impl Sync for UdpSocket {}
+}
+
+/// Returns `true` on platforms where `sendmsg(2)` is available and
+/// [`send_vectored`](UdpSocket::send_vectored) /
+/// [`send_to_vectored`](UdpSocket::send_to_vectored) issue a single
+/// zero-copy system call.
+///
+/// Returns `false` on platforms where the vectored methods fall back to
+/// concatenating all buffers into a temporary `Vec<u8>` before calling
+/// the kernel's single-buffer send path.
+pub fn is_vectored_supported() -> bool {
+    cfg!(unix)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::imp::UdpSocket;
+    use std::net::SocketAddr;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn send_recv_connected() {
@@ -180,7 +343,8 @@ mod tests {
             let mut buf = [0u8; 64];
             let (_n, peer) = server.recv_from(&mut buf).await.unwrap();
             let reply = b"pong";
-            server.send_to_vectored(&[std::io::IoSlice::new(&reply[..])], &peer)
+            server
+                .send_to_vectored(&[std::io::IoSlice::new(&reply[..])], &peer)
                 .await
                 .unwrap();
         });
@@ -203,12 +367,64 @@ mod tests {
 
         let header = b"HDR:";
         let body = b"hello vectored";
-        let iov = [IoSlice::new(header), IoSlice::new(body)];
-        server.send_to_vectored(&iov, &client_addr).await.unwrap();
+        let iov = [std::io::IoSlice::new(header), std::io::IoSlice::new(body)];
+        server
+            .send_to_vectored(&iov, &client_addr)
+            .await
+            .unwrap();
 
         let mut buf = [0u8; 64];
         let (n, src) = client.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"HDR:hello vectored");
         assert_eq!(src, server_addr);
+    }
+
+    #[tokio::test]
+    async fn send_vectored_two_buffers() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let a = UdpSocket::bind(bind).await.unwrap();
+        let b = UdpSocket::bind(bind).await.unwrap();
+        let b_addr = b.local_addr().unwrap();
+
+        let parts = [std::io::IoSlice::new(b"hello "), std::io::IoSlice::new(b"world")];
+        a.send_to_vectored(&parts, &b_addr).await.unwrap();
+
+        let mut buf = [0u8; 32];
+        let (n, _) = b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello world");
+    }
+
+    #[tokio::test]
+    async fn send_vectored_single_buffer_is_same_as_send() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let a = UdpSocket::bind(bind).await.unwrap();
+        let b = UdpSocket::bind(bind).await.unwrap();
+
+        let msg = b"single";
+        a.send_to_vectored(&[std::io::IoSlice::new(&msg[..])], &b.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 32];
+        let (n, _) = b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], msg);
+    }
+
+    #[tokio::test]
+    async fn set_and_read_ttl() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let sock = UdpSocket::bind(bind).await.unwrap();
+        sock.set_ttl(64).unwrap();
+        assert_eq!(sock.ttl().unwrap(), 64);
+    }
+
+    #[tokio::test]
+    async fn set_and_read_broadcast() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let sock = UdpSocket::bind(bind).await.unwrap();
+        sock.set_broadcast(true).unwrap();
+        assert!(sock.broadcast().unwrap());
+        sock.set_broadcast(false).unwrap();
+        assert!(!sock.broadcast().unwrap());
     }
 }
