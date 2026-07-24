@@ -38,6 +38,12 @@ mod imp {
         }
     }
 
+    impl std::os::fd::AsRawFd for UdpSocket {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            std::os::fd::AsRawFd::as_raw_fd(self.inner.get_ref())
+        }
+    }
+
     impl UdpSocket {
         pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
             let domain = match addr {
@@ -113,6 +119,19 @@ mod imp {
             &self.inner
         }
 
+        fn try_send_vectored(
+            &self,
+            bufs: &[IoSlice<'_>],
+            target: Option<&SockAddr>,
+        ) -> io::Result<usize> {
+            let msg = match target {
+                Some(addr) => MsgHdr::new().with_addr(addr).with_buffers(bufs),
+                None => MsgHdr::new().with_buffers(bufs),
+            };
+            self.inner.get_ref().sendmsg(&msg, 0)
+        }
+
+        #[cfg(not(target_os = "macos"))]
         fn poll_send_vectored(
             &self,
             cx: &mut Context<'_>,
@@ -120,16 +139,39 @@ mod imp {
             target: Option<&SockAddr>,
         ) -> Poll<io::Result<usize>> {
             loop {
-                let msg = match target {
-                    Some(addr) => MsgHdr::new().with_addr(addr).with_buffers(bufs),
-                    None => MsgHdr::new().with_buffers(bufs),
-                };
-                match self.inner.get_ref().sendmsg(&msg, 0) {
+                match self.try_send_vectored(bufs, target) {
                     Ok(n) => return Poll::Ready(Ok(n)),
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => return Poll::Ready(Err(e)),
                 }
                 ready!(self.inner.poll_write_ready(cx))?.clear_ready();
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        async fn send_vectored_with_bounded_backoff(
+            &self,
+            bufs: &[IoSlice<'_>],
+            target: Option<&SockAddr>,
+        ) -> io::Result<usize> {
+            const BACKOFFS_US: [u64; 5] = [1_000, 2_000, 4_000, 8_000, 16_000];
+            let mut attempt = 0;
+            loop {
+                match self.try_send_vectored(bufs, target) {
+                    Ok(n) => return Ok(n),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if attempt >= BACKOFFS_US.len() {
+                            return Err(e);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_micros(
+                            BACKOFFS_US[attempt],
+                        ))
+                        .await;
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
 
@@ -176,7 +218,14 @@ mod imp {
         }
 
         pub async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-            std::future::poll_fn(|cx| self.poll_send_vectored(cx, bufs, None)).await
+            #[cfg(target_os = "macos")]
+            {
+                self.send_vectored_with_bounded_backoff(bufs, None).await
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                std::future::poll_fn(|cx| self.poll_send_vectored(cx, bufs, None)).await
+            }
         }
 
         pub async fn send_to_vectored(
@@ -185,7 +234,14 @@ mod imp {
             target: &SocketAddr,
         ) -> io::Result<usize> {
             let addr = SockAddr::from(*target);
-            std::future::poll_fn(|cx| self.poll_send_vectored(cx, bufs, Some(&addr))).await
+            #[cfg(target_os = "macos")]
+            {
+                self.send_vectored_with_bounded_backoff(bufs, Some(&addr)).await
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                std::future::poll_fn(|cx| self.poll_send_vectored(cx, bufs, Some(&addr))).await
+            }
         }
 
         pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
