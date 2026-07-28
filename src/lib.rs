@@ -23,7 +23,7 @@ mod imp {
     use std::io::{self, IoSlice};
     use std::mem::MaybeUninit;
     use std::net::SocketAddr;
-    use std::task::{ready, Context, Poll};
+    use std::task::{Context, Poll, ready};
 
     use socket2::{MsgHdr, SockAddr};
     use tokio::io::unix::AsyncFd;
@@ -50,11 +50,8 @@ mod imp {
                 SocketAddr::V4(_) => socket2::Domain::IPV4,
                 SocketAddr::V6(_) => socket2::Domain::IPV6,
             };
-            let socket = socket2::Socket::new(
-                domain,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            )?;
+            let socket =
+                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
             socket.set_nonblocking(true)?;
             socket.bind(&SockAddr::from(addr))?;
             let inner = AsyncFd::new(socket)?;
@@ -89,25 +86,33 @@ mod imp {
             self.inner.get_ref().broadcast()
         }
 
-        pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
-            self.inner.get_ref().set_ttl(ttl)
+        pub fn set_ttl_v4(&self, ttl: u32) -> io::Result<()> {
+            self.inner.get_ref().set_ttl_v4(ttl)
         }
 
-        pub fn ttl(&self) -> io::Result<u32> {
-            self.inner.get_ref().ttl()
+        pub fn ttl_v4(&self) -> io::Result<u32> {
+            self.inner.get_ref().ttl_v4()
         }
 
         pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
             self.inner.get_ref().set_multicast_loop_v4(on)
         }
 
-        pub fn join_multicast_v4(&self, multi_addr: &std::net::Ipv4Addr, interface: &std::net::Ipv4Addr) -> io::Result<()> {
+        pub fn join_multicast_v4(
+            &self,
+            multi_addr: &std::net::Ipv4Addr,
+            interface: &std::net::Ipv4Addr,
+        ) -> io::Result<()> {
             self.inner
                 .get_ref()
                 .join_multicast_v4(multi_addr, interface)
         }
 
-        pub fn leave_multicast_v4(&self, multi_addr: &std::net::Ipv4Addr, interface: &std::net::Ipv4Addr) -> io::Result<()> {
+        pub fn leave_multicast_v4(
+            &self,
+            multi_addr: &std::net::Ipv4Addr,
+            interface: &std::net::Ipv4Addr,
+        ) -> io::Result<()> {
             self.inner
                 .get_ref()
                 .leave_multicast_v4(multi_addr, interface)
@@ -164,10 +169,8 @@ mod imp {
                         if attempt >= BACKOFFS_US.len() {
                             return Err(e);
                         }
-                        tokio::time::sleep(std::time::Duration::from_micros(
-                            BACKOFFS_US[attempt],
-                        ))
-                        .await;
+                        tokio::time::sleep(std::time::Duration::from_micros(BACKOFFS_US[attempt]))
+                            .await;
                         attempt += 1;
                     }
                     Err(e) => return Err(e),
@@ -175,16 +178,9 @@ mod imp {
             }
         }
 
-        fn poll_recv(
-            &self,
-            cx: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<io::Result<usize>> {
+        fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
             let buf = unsafe {
-                std::slice::from_raw_parts_mut(
-                    buf.as_mut_ptr() as *mut MaybeUninit<u8>,
-                    buf.len(),
-                )
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len())
             };
             loop {
                 match self.inner.get_ref().recv(buf) {
@@ -202,10 +198,7 @@ mod imp {
             buf: &mut [u8],
         ) -> Poll<io::Result<(usize, SockAddr)>> {
             let buf = unsafe {
-                std::slice::from_raw_parts_mut(
-                    buf.as_mut_ptr() as *mut MaybeUninit<u8>,
-                    buf.len(),
-                )
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len())
             };
             loop {
                 match self.inner.get_ref().recv_from(buf) {
@@ -236,7 +229,8 @@ mod imp {
             let addr = SockAddr::from(*target);
             #[cfg(target_os = "macos")]
             {
-                self.send_vectored_with_bounded_backoff(bufs, Some(&addr)).await
+                self.send_vectored_with_bounded_backoff(bufs, Some(&addr))
+                    .await
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -286,10 +280,7 @@ mod imp {
         /// is available.
         pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
             let buf: &mut [MaybeUninit<u8>] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    buf.as_mut_ptr() as *mut MaybeUninit<u8>,
-                    buf.len(),
-                )
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len())
             };
             self.inner.get_ref().recv(buf)
         }
@@ -300,10 +291,7 @@ mod imp {
             dst: &mut bytes::buf::UninitSlice,
         ) -> Poll<io::Result<usize>> {
             let buf: &mut [MaybeUninit<u8>] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    dst.as_mut_ptr() as *mut MaybeUninit<u8>,
-                    dst.len(),
-                )
+                std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut MaybeUninit<u8>, dst.len())
             };
             loop {
                 match self.inner.get_ref().recv(buf) {
@@ -321,10 +309,7 @@ mod imp {
             dst: &mut bytes::buf::UninitSlice,
         ) -> Poll<io::Result<(usize, SockAddr)>> {
             let buf: &mut [MaybeUninit<u8>] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    dst.as_mut_ptr() as *mut MaybeUninit<u8>,
-                    dst.len(),
-                )
+                std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut MaybeUninit<u8>, dst.len())
             };
             loop {
                 match self.inner.get_ref().recv_from(buf) {
@@ -342,7 +327,9 @@ mod imp {
             let dst = buf.chunk_mut();
             let n = std::future::poll_fn(|cx| self.poll_recv_buf(cx, dst)).await?;
             // SAFETY: `n` bytes were written by the kernel into `dst`.
-            unsafe { buf.advance_mut(n); }
+            unsafe {
+                buf.advance_mut(n);
+            }
             Ok(n)
         }
 
@@ -354,7 +341,9 @@ mod imp {
             let dst = buf.chunk_mut();
             let (n, addr) = std::future::poll_fn(|cx| self.poll_recv_buf_from(cx, dst)).await?;
             // SAFETY: `n` bytes were written by the kernel into `dst`.
-            unsafe { buf.advance_mut(n); }
+            unsafe {
+                buf.advance_mut(n);
+            }
             let addr = addr
                 .as_socket()
                 .ok_or_else(|| io::Error::other("failed to convert source address"))?;
@@ -552,10 +541,7 @@ mod tests {
         let header = b"HDR:";
         let body = b"hello vectored";
         let iov = [std::io::IoSlice::new(header), std::io::IoSlice::new(body)];
-        server
-            .send_to_vectored(&iov, &client_addr)
-            .await
-            .unwrap();
+        server.send_to_vectored(&iov, &client_addr).await.unwrap();
 
         let mut buf = [0u8; 64];
         let (n, src) = client.recv_from(&mut buf).await.unwrap();
@@ -570,7 +556,10 @@ mod tests {
         let b = UdpSocket::bind(bind).await.unwrap();
         let b_addr = b.local_addr().unwrap();
 
-        let parts = [std::io::IoSlice::new(b"hello "), std::io::IoSlice::new(b"world")];
+        let parts = [
+            std::io::IoSlice::new(b"hello "),
+            std::io::IoSlice::new(b"world"),
+        ];
         a.send_to_vectored(&parts, &b_addr).await.unwrap();
 
         let mut buf = [0u8; 32];
@@ -598,8 +587,8 @@ mod tests {
     async fn set_and_read_ttl() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let sock = UdpSocket::bind(bind).await.unwrap();
-        sock.set_ttl(64).unwrap();
-        assert_eq!(sock.ttl().unwrap(), 64);
+        sock.set_ttl_v4(64).unwrap();
+        assert_eq!(sock.ttl_v4().unwrap(), 64);
     }
 
     #[tokio::test]
