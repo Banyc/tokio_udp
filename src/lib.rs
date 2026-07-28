@@ -74,7 +74,7 @@ mod imp {
                 .ok_or_else(|| io::Error::other("failed to convert peer address"))
         }
 
-        pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+        pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
             self.inner.get_ref().connect(&SockAddr::from(addr))
         }
 
@@ -388,8 +388,8 @@ mod imp {
             self.inner.peer_addr()
         }
 
-        pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-            self.inner.connect(addr).into()
+        pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+            self.inner.connect(addr).await
         }
 
         pub fn set_broadcast(&self, on: bool) -> io::Result<()> {
@@ -400,11 +400,11 @@ mod imp {
             self.inner.broadcast()
         }
 
-        pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        pub fn set_ttl_v4(&self, ttl: u32) -> io::Result<()> {
             self.inner.set_ttl(ttl)
         }
 
-        pub fn ttl(&self) -> io::Result<u32> {
+        pub fn ttl_v4(&self) -> io::Result<u32> {
             self.inner.ttl()
         }
 
@@ -459,7 +459,7 @@ mod imp {
         }
 
         pub fn try_send_to(&self, buf: &[u8], target: &SocketAddr) -> io::Result<usize> {
-            self.inner.try_send_to(buf, target)
+            self.inner.try_send_to(buf, *target)
         }
 
         pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -510,7 +510,7 @@ mod tests {
         let server_addr = server.local_addr().unwrap();
 
         let client = UdpSocket::bind(bind).await.unwrap();
-        client.connect(server_addr).unwrap();
+        client.connect(server_addr).await.unwrap();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 64];
