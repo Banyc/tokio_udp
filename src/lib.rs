@@ -349,6 +349,10 @@ mod imp {
                 .ok_or_else(|| io::Error::other("failed to convert source address"))?;
             Ok((n, addr))
         }
+
+        pub fn try_clone_std(&self) -> io::Result<std::net::UdpSocket> {
+            Ok(self.inner.get_ref().try_clone()?.into())
+        }
     }
 
     unsafe impl Send for UdpSocket {}
@@ -475,6 +479,22 @@ mod imp {
             buf: &mut impl bytes::BufMut,
         ) -> io::Result<(usize, SocketAddr)> {
             self.inner.recv_buf_from(buf).await
+        }
+
+        pub fn try_clone_std(&self) -> io::Result<std::net::UdpSocket> {
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::{AsRawSocket, BorrowedSocket};
+                let borrowed = unsafe { BorrowedSocket::borrow_raw(self.inner.as_raw_socket()) };
+                Ok(std::net::UdpSocket::from(borrowed.try_clone_to_owned()?))
+            }
+            #[cfg(not(windows))]
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "socket clone unsupported on this platform",
+                ))
+            }
         }
     }
 
