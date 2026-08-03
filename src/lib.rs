@@ -239,6 +239,57 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_would_block_try_send_stops_claiming_the_socket_is_writable() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let server = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind(bind).await.unwrap();
+        client.connect(server_addr).await.unwrap();
+
+        // Clamp the sender's send buffer and the peer's receive buffer so
+        // queued datagrams pile up; the peer never reads. (`async_fd` is
+        // unix-only and gives access to the underlying socket2 socket.)
+        client.async_fd().get_ref().set_send_buffer_size(512).unwrap();
+        server.async_fd().get_ref().set_recv_buffer_size(512).unwrap();
+
+        let msg = [0u8; 256];
+        let mut sent = 0u64;
+        let would_block = loop {
+            match client.try_send(&msg) {
+                Ok(_) => sent += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break true,
+                Err(e) => panic!("{e}"),
+            }
+            if sent >= 100_000 {
+                // macOS loopback delivers datagrams synchronously, so the
+                // kernel never reports a UDP send buffer as full (an
+                // unreachable neighbor ends in EHOSTUNREACH instead of
+                // WouldBlock); only kernels with real send-buffer
+                // backpressure (e.g. Linux) reach WouldBlock here.
+                break false;
+            }
+        };
+
+        if would_block {
+            let again =
+                tokio::time::timeout(std::time::Duration::from_millis(200), client.writable())
+                    .await;
+            assert!(
+                again.is_err(),
+                "writable() returned with the send buffer still full"
+            );
+        } else {
+            // Kernel never backpressured: the socket is genuinely writable,
+            // so writable() must complete rather than report not-writable.
+            tokio::time::timeout(std::time::Duration::from_millis(200), client.writable())
+                .await
+                .expect("socket is writable but writable() never returned")
+                .expect("writable() reported a genuinely writable socket as not writable");
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn try_send_on_a_socket_the_driver_has_not_polled_yet_still_sends() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
