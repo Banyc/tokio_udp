@@ -24,7 +24,7 @@ mod imp;
 /// Returns `false` on platforms where the vectored methods fall back to
 /// concatenating all buffers into a temporary `Vec<u8>` before calling
 /// the kernel's single-buffer send path.
-#[allow(dead_code)]
+#[expect(dead_code)]
 async fn every_platform_has_the_whole_api(
     socket: &UdpSocket,
     addr: std::net::SocketAddr,
