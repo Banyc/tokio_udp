@@ -12,20 +12,14 @@
 /// `sendmsg(2)` for zero-copy vectored sends. On other platforms it wraps
 /// `tokio::net::UdpSocket` and falls back to concatenation for vectored
 /// sends.
-pub use imp::UdpSocket;
+pub use platform::UdpSocket;
 
-mod imp;
+mod platform;
 
-/// Returns `true` on platforms where `sendmsg(2)` is available and
-/// [`send_vectored`](UdpSocket::send_vectored) /
-/// [`send_to_vectored`](UdpSocket::send_to_vectored) issue a single
-/// zero-copy system call.
-///
-/// Returns `false` on platforms where the vectored methods fall back to
-/// concatenating all buffers into a temporary `Vec<u8>` before calling
-/// the kernel's single-buffer send path.
+/// Compile-time parity check: instantiates every public API so both platform
+/// implementations must expose the identical surface. Never called.
 #[expect(dead_code)]
-async fn every_platform_has_the_whole_api(
+async fn assert_api_parity(
     socket: &UdpSocket,
     addr: std::net::SocketAddr,
     group: std::net::Ipv4Addr,
@@ -60,6 +54,14 @@ async fn every_platform_has_the_whole_api(
     Ok(())
 }
 
+/// Returns `true` on platforms where `sendmsg(2)` is available and
+/// [`send_vectored`](UdpSocket::send_vectored) /
+/// [`send_to_vectored`](UdpSocket::send_to_vectored) issue a single
+/// zero-copy system call.
+///
+/// Returns `false` on platforms where the vectored methods fall back to
+/// concatenating all buffers into a temporary `Vec<u8>` before calling
+/// the kernel's single-buffer send path.
 pub fn is_vectored_supported() -> bool {
     cfg!(unix)
 }
@@ -70,7 +72,7 @@ pub fn is_vectored_supported() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::imp::UdpSocket;
+    use super::platform::UdpSocket;
     use std::net::SocketAddr;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -251,8 +253,16 @@ mod tests {
         // Clamp the sender's send buffer and the peer's receive buffer so
         // queued datagrams pile up; the peer never reads. (`async_fd` is
         // unix-only and gives access to the underlying socket2 socket.)
-        client.async_fd().get_ref().set_send_buffer_size(512).unwrap();
-        server.async_fd().get_ref().set_recv_buffer_size(512).unwrap();
+        client
+            .async_fd()
+            .get_ref()
+            .set_send_buffer_size(512)
+            .unwrap();
+        server
+            .async_fd()
+            .get_ref()
+            .set_recv_buffer_size(512)
+            .unwrap();
 
         let msg = [0u8; 256];
         let mut sent = 0u64;

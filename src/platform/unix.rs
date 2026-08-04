@@ -175,10 +175,7 @@ impl UdpSocket {
             .await
     }
 
-    async fn recv_from_uninit(
-        &self,
-        buf: &mut [MaybeUninit<u8>],
-    ) -> io::Result<(usize, SockAddr)> {
+    async fn recv_from_uninit(&self, buf: &mut [MaybeUninit<u8>]) -> io::Result<(usize, SockAddr)> {
         self.inner
             .async_io(Interest::READABLE, |sock| sock.recv_from(buf))
             .await
@@ -236,7 +233,18 @@ impl UdpSocket {
         self.inner.writable().await.map(|_| ())
     }
 
-    fn readiness_is_stale(&self, interest: Interest) {
+    /// Clear `AsyncFd`'s cached readiness for `interest` without doing any I/O.
+    ///
+    /// `AsyncFd` caches kernel readiness: once an interest has been observed
+    /// ready it keeps reporting so until explicitly cleared. After a raw
+    /// non-blocking sendmsg returns `EWOULDBLOCK`, that cached writable
+    /// readiness is stale — the kernel is telling us the socket is *not*
+    /// ready, yet a subsequent `writable()` await would still return
+    /// immediately off the stale cache instead of blocking. Forcing the
+    /// `try_io` closure to return `WouldBlock` makes `AsyncFd` drop the cached
+    /// readiness, so the driver re-arms the interest and the next await only
+    /// completes when the kernel reports the socket genuinely ready again.
+    fn clear_readiness(&self, interest: Interest) {
         let _ = self
             .inner
             .try_io(interest, |_| -> io::Result<()> { Err(would_block()) });
@@ -245,29 +253,32 @@ impl UdpSocket {
     /// Attempt a non-blocking send. Returns `WouldBlock` if the kernel
     /// buffer is full.
     pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.clearing_readiness(Interest::WRITABLE, self.inner.get_ref().send(buf))
+        self.clear_readiness_on_would_block(Interest::WRITABLE, self.inner.get_ref().send(buf))
     }
 
     /// Attempt a non-blocking send to a target address.
     pub fn try_send_to(&self, buf: &[u8], target: &SocketAddr) -> io::Result<usize> {
         let addr = SockAddr::from(*target);
-        self.clearing_readiness(Interest::WRITABLE, self.inner.get_ref().send_to(buf, &addr))
+        self.clear_readiness_on_would_block(
+            Interest::WRITABLE,
+            self.inner.get_ref().send_to(buf, &addr),
+        )
     }
 
     /// Attempt a non-blocking receive. Returns `WouldBlock` if no data
     /// is available.
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.get_ref().recv(Self::as_uninit(buf));
-        self.clearing_readiness(Interest::READABLE, n)
+        self.clear_readiness_on_would_block(Interest::READABLE, n)
     }
 
-    fn clearing_readiness<T>(
+    fn clear_readiness_on_would_block<T>(
         &self,
         interest: Interest,
         result: io::Result<T>,
     ) -> io::Result<T> {
         if matches!(&result, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
-            self.readiness_is_stale(interest);
+            self.clear_readiness(interest);
         }
         result
     }
@@ -278,7 +289,7 @@ impl UdpSocket {
         }
     }
 
-    /// Receive into a `BufMut` (vectored bytes buffer). Returns the
+    /// Receive into a `BufMut` (bytes buffer). Returns the
     /// number of bytes read.
     pub async fn recv_buf(&self, buf: &mut impl bytes::BufMut) -> io::Result<usize> {
         let dst = buf.chunk_mut();
