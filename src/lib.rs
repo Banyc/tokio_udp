@@ -84,7 +84,8 @@ mod tests {
         let client = UdpSocket::bind(bind).await.unwrap();
         client.connect(server_addr).await.unwrap();
 
-        tokio::spawn(async move {
+        let mut server_task = tokio::task::JoinSet::new();
+        server_task.spawn(async move {
             let mut buf = [0u8; 64];
             let (_n, peer) = server.recv_from(&mut buf).await.unwrap();
             let reply = b"pong";
@@ -99,6 +100,9 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = client.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"pong");
+        while let Some(result) = server_task.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test]
