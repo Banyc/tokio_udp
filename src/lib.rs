@@ -76,6 +76,7 @@ mod tests {
     use std::net::SocketAddr;
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn send_recv_connected() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -106,6 +107,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn send_to_vectored_recv_from() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -126,6 +128,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn send_vectored_two_buffers() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let a = UdpSocket::bind(bind).await.unwrap();
@@ -144,6 +147,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn send_vectored_single_buffer_is_same_as_send() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let a = UdpSocket::bind(bind).await.unwrap();
@@ -160,6 +164,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn two_tasks_can_await_recv_on_one_socket() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = std::sync::Arc::new(UdpSocket::bind(bind).await.unwrap());
@@ -193,6 +198,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn two_tasks_can_await_send_on_one_socket() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -214,6 +220,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn a_would_block_try_recv_stops_claiming_the_socket_is_readable() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -247,6 +254,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn a_would_block_try_send_stops_claiming_the_socket_is_writable() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -305,6 +313,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn try_send_on_a_socket_the_driver_has_not_polled_yet_still_sends() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -318,6 +327,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn set_and_read_ttl() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let sock = UdpSocket::bind(bind).await.unwrap();
@@ -326,6 +336,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn set_and_read_broadcast() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let sock = UdpSocket::bind(bind).await.unwrap();
