@@ -14,6 +14,36 @@ fn would_block() -> io::Error {
     io::ErrorKind::WouldBlock.into()
 }
 
+/// Readiness interests awaited for an asynchronous receive.
+///
+/// `ERROR` is awaited alongside `READABLE` because a connected socket's
+/// pending `SO_ERROR` — for example the `ECONNREFUSED` an ICMP
+/// port-unreachable queues on the socket — is delivered as an error
+/// readiness event that is *not* folded into read readiness on every
+/// platform: `mio`'s epoll selector maps `EPOLLERR` to a distinct
+/// readiness bit, so awaiting only `READABLE` can park the receive forever
+/// instead of surfacing the error. tokio's own `UdpSocket` awaits
+/// `Interest::READABLE | Interest::ERROR` for exactly this reason, and the
+/// receive closure consumes the error on its next call. Send readiness is
+/// deliberately left as `WRITABLE` only, matching tokio.
+const RECV_INTEREST: Interest = Interest::READABLE.add(Interest::ERROR);
+
+/// The bounded backoff schedule for the macOS `sendmsg` `EWOULDBLOCK` retry
+/// loop: `BACKOFFS_US[i]` is the sleep before retry number `i + 1`. The loop
+/// consults [`would_block_retry_micros`], the single decision authority, so
+/// the schedule and its exhaustion boundary are machine-checked without
+/// needing a real full-send-buffer socket (which macOS cannot produce — a
+/// UDP peer whose receive queue is full drops the datagram instead of
+/// backpressuring the sender; see the tests below).
+const BACKOFFS_US: [u64; 5] = [1_000, 2_000, 4_000, 8_000, 16_000];
+
+/// The retry decision for one `EWOULDBLOCK` outcome: the sleep (micros)
+/// before the next attempt, or `None` when the bounded retry budget is
+/// exhausted and the error must be returned to the caller. Pure, so the
+/// budget math is exhaustively testable.
+fn would_block_retry_micros(attempt: usize) -> Option<u64> {
+    BACKOFFS_US.get(attempt).copied()
+}
 pub struct UdpSocket {
     inner: AsyncFd<socket2::Socket>,
 }
@@ -144,19 +174,19 @@ impl UdpSocket {
         bufs: &[IoSlice<'_>],
         target: Option<&SockAddr>,
     ) -> io::Result<usize> {
-        const BACKOFFS_US: [u64; 5] = [1_000, 2_000, 4_000, 8_000, 16_000];
         let mut attempt = 0;
         loop {
             match self.try_send_vectored(bufs, target) {
                 Ok(n) => return Ok(n),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if attempt >= BACKOFFS_US.len() {
-                        return Err(e);
+                    match would_block_retry_micros(attempt) {
+                        Some(micros) => {
+                            tokio::time::sleep(std::time::Duration::from_micros(micros)).await;
+                            attempt += 1;
+                        }
+                        None => return Err(e),
                     }
-                    tokio::time::sleep(std::time::Duration::from_micros(BACKOFFS_US[attempt]))
-                        .await;
-                    attempt += 1;
                 }
                 Err(e) => return Err(e),
             }
@@ -171,13 +201,13 @@ impl UdpSocket {
 
     async fn recv_uninit(&self, buf: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
         self.inner
-            .async_io(Interest::READABLE, |sock| sock.recv(buf))
+            .async_io(RECV_INTEREST, |sock| sock.recv(buf))
             .await
     }
 
     async fn recv_from_uninit(&self, buf: &mut [MaybeUninit<u8>]) -> io::Result<(usize, SockAddr)> {
         self.inner
-            .async_io(Interest::READABLE, |sock| sock.recv_from(buf))
+            .async_io(RECV_INTEREST, |sock| sock.recv_from(buf))
             .await
     }
 
@@ -314,5 +344,74 @@ impl UdpSocket {
 
     pub fn try_clone_std(&self) -> io::Result<std::net::UdpSocket> {
         Ok(self.inner.get_ref().try_clone()?.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RECV_INTEREST, UdpSocket};
+    use std::net::SocketAddr;
+
+    /// The async receive must await `ERROR` as well as `READABLE`: a pending
+    /// `SO_ERROR` is a distinct error readiness bit on some platforms, and a
+    /// receive that awaits only `READABLE` parks forever there instead of
+    /// surfacing the error. This pins the guarded property directly, so it
+    /// fails on every platform if `ERROR` is dropped from the wait.
+    #[test]
+    fn recv_interest_surfaces_a_pending_error() {
+        assert!(RECV_INTEREST.is_readable(), "recv must await READABLE");
+        assert!(
+            RECV_INTEREST.is_error(),
+            "recv must await ERROR so a pending SO_ERROR wakes it"
+        );
+    }
+
+    /// The bounded-backoff budget math (the single decision authority the
+    /// macOS retry loop consults): attempts 0..4 get the documented sleep,
+    /// attempt 5 exhausts the budget and must return `None` so the loop
+    /// returns the `EWOULDBLOCK` error. Vacuity: shrink the schedule or the
+    /// exhaustion bound and this fails naming the arm.
+    #[test]
+    fn would_block_retry_micros_covers_the_schedule_and_exhausts() {
+        let expected = [1_000u64, 2_000, 4_000, 8_000, 16_000];
+        for (attempt, want) in expected.iter().enumerate() {
+            assert_eq!(
+                super::would_block_retry_micros(attempt),
+                Some(*want),
+                "attempt {attempt} must sleep the documented backoff"
+            );
+        }
+        assert_eq!(
+            super::would_block_retry_micros(expected.len()),
+            None,
+            "the bounded retry budget must be exhausted after {} would-blocks",
+            expected.len()
+        );
+    }
+
+    /// The other-error arm of the macOS backoff loop is the only arm a real
+    /// socket can drive deterministically on this host: a zero-`iovec`
+    /// `sendmsg(2)` fails immediately with `EMSGSIZE`, which is neither
+    /// `EWOULDBLOCK` nor `EINTR`, so it must propagate straight back without
+    /// consuming any retry budget. (The `EWOULDBLOCK` arms are not
+    /// deterministically reachable on macOS: a UDP peer whose receive queue
+    /// is full drops the datagram instead of backpressuring the sender, so a
+    /// send buffer never fills hard enough to block — verified empirically;
+    /// `EINTR` needs a signal racing a syscall, also non-deterministic.)
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn send_vectored_propagates_a_non_blocking_error_without_backoff() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let sock = UdpSocket::bind(bind).await.unwrap();
+        let err = sock
+            .send_vectored(&[])
+            .await
+            .expect_err("an empty iovec list must fail");
+        assert!(
+            err.kind() != std::io::ErrorKind::WouldBlock
+                && err.kind() != std::io::ErrorKind::Interrupted,
+            "a non-blocking error must propagate without being retried: {err:?}"
+        );
     }
 }

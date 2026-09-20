@@ -219,6 +219,37 @@ mod tests {
         }
     }
 
+    /// A connected socket's pending `SO_ERROR` — the `ECONNREFUSED` an ICMP
+    /// port-unreachable queues after the peer's socket closes — must wake an
+    /// asynchronous `recv` and be surfaced, not be swallowed or left to park
+    /// the reader. `send` to a freshly closed loopback port queues exactly
+    /// that error. On Linux this pins awaiting `Interest::ERROR` (a
+    /// `READABLE`-only wait parks forever there); on macOS the error is also
+    /// folded into read readiness, so the wait completes either way.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn recv_surfaces_a_pending_so_error() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        // A freshly bound-then-dropped loopback port is closed, so a datagram
+        // sent to it draws back an ICMP port-unreachable.
+        let closed = {
+            let s = std::net::UdpSocket::bind(bind).unwrap();
+            s.local_addr().unwrap()
+        };
+        let client = UdpSocket::bind(bind).await.unwrap();
+        client.connect(closed).await.unwrap();
+        client.send(b"x").await.unwrap();
+        // Give the ICMP port-unreachable time to be queued as SO_ERROR.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut buf = [0u8; 8];
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.recv(&mut buf))
+                .await
+                .expect("recv parked on a pending SO_ERROR (READABLE-only wait)");
+        let err = outcome.expect_err("a pending SO_ERROR must surface as a recv error");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     async fn a_would_block_try_recv_stops_claiming_the_socket_is_readable() {
@@ -344,5 +375,52 @@ mod tests {
         assert!(sock.broadcast().unwrap());
         sock.set_broadcast(false).unwrap();
         assert!(!sock.broadcast().unwrap());
+    }
+
+    /// `recv_buf` must advance the growable buffer by the number of bytes read,
+    /// so the caller observes the datagram; a `recv_buf` that fills the spare
+    /// capacity but never commits the length reports `n` bytes that are
+    /// invisible (`buf.len() == 0`).
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn recv_buf_advances_the_growable_buffer() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let server = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind(bind).await.unwrap();
+        client
+            .send_to_vectored(&[std::io::IoSlice::new(b"hello")], &server_addr)
+            .await
+            .unwrap();
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        let n = server.recv_buf(&mut buf).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(
+            &buf[..],
+            b"hello",
+            "recv_buf must commit the read bytes to the buffer"
+        );
+
+        client
+            .send_to_vectored(&[std::io::IoSlice::new(b"world")], &server_addr)
+            .await
+            .unwrap();
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        let (n, src) = server.recv_buf_from(&mut buf).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(
+            &buf[..],
+            b"world",
+            "recv_buf_from must commit the read bytes to the buffer"
+        );
+        assert_eq!(src, client.local_addr().unwrap());
+    }
+
+    /// Whether vectored sends avoid the temporary concatenation is a
+    /// per-platform backend decision; on Unix the `sendmsg(2)` backend reports
+    /// `true` and the Windows fallback reports `false`.
+    #[test]
+    fn is_vectored_supported_reflects_the_platform_backend() {
+        assert_eq!(super::is_vectored_supported(), cfg!(unix));
     }
 }
