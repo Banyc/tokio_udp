@@ -76,6 +76,7 @@ mod tests {
     use std::net::SocketAddr;
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn send_recv_connected() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -84,7 +85,8 @@ mod tests {
         let client = UdpSocket::bind(bind).await.unwrap();
         client.connect(server_addr).await.unwrap();
 
-        tokio::spawn(async move {
+        let mut server_task = tokio::task::JoinSet::new();
+        server_task.spawn(async move {
             let mut buf = [0u8; 64];
             let (_n, peer) = server.recv_from(&mut buf).await.unwrap();
             let reply = b"pong";
@@ -99,9 +101,13 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = client.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"pong");
+        while let Some(result) = server_task.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn send_to_vectored_recv_from() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -122,6 +128,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn send_vectored_two_buffers() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let a = UdpSocket::bind(bind).await.unwrap();
@@ -140,6 +147,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn send_vectored_single_buffer_is_same_as_send() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let a = UdpSocket::bind(bind).await.unwrap();
@@ -156,6 +164,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn two_tasks_can_await_recv_on_one_socket() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = std::sync::Arc::new(UdpSocket::bind(bind).await.unwrap());
@@ -189,6 +198,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn two_tasks_can_await_send_on_one_socket() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -209,7 +219,39 @@ mod tests {
         }
     }
 
+    /// A connected socket's pending `SO_ERROR` — the `ECONNREFUSED` an ICMP
+    /// port-unreachable queues after the peer's socket closes — must wake an
+    /// asynchronous `recv` and be surfaced, not be swallowed or left to park
+    /// the reader. `send` to a freshly closed loopback port queues exactly
+    /// that error. On Linux this pins awaiting `Interest::ERROR` (a
+    /// `READABLE`-only wait parks forever there); on macOS the error is also
+    /// folded into read readiness, so the wait completes either way.
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn recv_surfaces_a_pending_so_error() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        // A freshly bound-then-dropped loopback port is closed, so a datagram
+        // sent to it draws back an ICMP port-unreachable.
+        let closed = {
+            let s = std::net::UdpSocket::bind(bind).unwrap();
+            s.local_addr().unwrap()
+        };
+        let client = UdpSocket::bind(bind).await.unwrap();
+        client.connect(closed).await.unwrap();
+        client.send(b"x").await.unwrap();
+        // Give the ICMP port-unreachable time to be queued as SO_ERROR.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut buf = [0u8; 8];
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.recv(&mut buf))
+                .await
+                .expect("recv parked on a pending SO_ERROR (READABLE-only wait)");
+        let err = outcome.expect_err("a pending SO_ERROR must surface as a recv error");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn a_would_block_try_recv_stops_claiming_the_socket_is_readable() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -243,6 +285,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn a_would_block_try_send_stops_claiming_the_socket_is_writable() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -301,6 +344,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn try_send_on_a_socket_the_driver_has_not_polled_yet_still_sends() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
@@ -314,6 +358,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn set_and_read_ttl() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let sock = UdpSocket::bind(bind).await.unwrap();
@@ -322,6 +367,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn set_and_read_broadcast() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let sock = UdpSocket::bind(bind).await.unwrap();
@@ -329,5 +375,52 @@ mod tests {
         assert!(sock.broadcast().unwrap());
         sock.set_broadcast(false).unwrap();
         assert!(!sock.broadcast().unwrap());
+    }
+
+    /// `recv_buf` must advance the growable buffer by the number of bytes read,
+    /// so the caller observes the datagram; a `recv_buf` that fills the spare
+    /// capacity but never commits the length reports `n` bytes that are
+    /// invisible (`buf.len() == 0`).
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn recv_buf_advances_the_growable_buffer() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let server = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind(bind).await.unwrap();
+        client
+            .send_to_vectored(&[std::io::IoSlice::new(b"hello")], &server_addr)
+            .await
+            .unwrap();
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        let n = server.recv_buf(&mut buf).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(
+            &buf[..],
+            b"hello",
+            "recv_buf must commit the read bytes to the buffer"
+        );
+
+        client
+            .send_to_vectored(&[std::io::IoSlice::new(b"world")], &server_addr)
+            .await
+            .unwrap();
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        let (n, src) = server.recv_buf_from(&mut buf).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(
+            &buf[..],
+            b"world",
+            "recv_buf_from must commit the read bytes to the buffer"
+        );
+        assert_eq!(src, client.local_addr().unwrap());
+    }
+
+    /// Whether vectored sends avoid the temporary concatenation is a
+    /// per-platform backend decision; on Unix the `sendmsg(2)` backend reports
+    /// `true` and the Windows fallback reports `false`.
+    #[test]
+    fn is_vectored_supported_reflects_the_platform_backend() {
+        assert_eq!(super::is_vectored_supported(), cfg!(unix));
     }
 }
