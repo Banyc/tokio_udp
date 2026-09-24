@@ -10,10 +10,6 @@ use socket2::{MsgHdr, SockAddr};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
-fn would_block() -> io::Error {
-    io::ErrorKind::WouldBlock.into()
-}
-
 /// Readiness interests awaited for an asynchronous receive.
 ///
 /// `ERROR` is awaited alongside `READABLE` because a connected socket's
@@ -263,54 +259,62 @@ impl UdpSocket {
         self.inner.writable().await.map(|_| ())
     }
 
-    /// Clear `AsyncFd`'s cached readiness for `interest` without doing any I/O.
+    /// Run one non-blocking operation, keeping `AsyncFd`'s cached readiness in
+    /// step with the kernel.
     ///
     /// `AsyncFd` caches kernel readiness: once an interest has been observed
-    /// ready it keeps reporting so until explicitly cleared. After a raw
-    /// non-blocking sendmsg returns `EWOULDBLOCK`, that cached writable
-    /// readiness is stale — the kernel is telling us the socket is *not*
-    /// ready, yet a subsequent `writable()` await would still return
-    /// immediately off the stale cache instead of blocking. Forcing the
-    /// `try_io` closure to return `WouldBlock` makes `AsyncFd` drop the cached
-    /// readiness, so the driver re-arms the interest and the next await only
-    /// completes when the kernel reports the socket genuinely ready again.
-    fn clear_readiness(&self, interest: Interest) {
-        let _ = self
-            .inner
-            .try_io(interest, |_| -> io::Result<()> { Err(would_block()) });
+    /// ready it keeps reporting so until explicitly cleared. An operation that
+    /// returns `WouldBlock` therefore leaves that cached readiness stale — a
+    /// later `readable()`/`writable()` await would return immediately off the
+    /// stale event instead of parking — so the event has to be cleared.
+    ///
+    /// The event that may be cleared is the one `AsyncFd::try_io` snapshots as
+    /// the operation *starts*, never one read back once it has finished.
+    /// `try_io` clears that snapshot via `ScheduledIo::set_readiness(Tick::Clear)`,
+    /// which is a no-op if the driver has published a newer event in the
+    /// meantime (the tick no longer matches). An event published while the
+    /// operation runs has already woken whoever was parked for it; consuming it
+    /// would strand that waiter — woken, re-polling, finding the cache empty —
+    /// in front of the very datagram the event was announcing.
+    ///
+    /// `try_io` skips the operation entirely when nothing is cached, so fall
+    /// back to a bare attempt then: a non-blocking call on a socket whose
+    /// readiness has never been observed must still reach the kernel, and with
+    /// nothing cached there is nothing to clear either (any event published from
+    /// here on belongs to a waiter this call never observed).
+    fn nonblocking<T>(
+        &self,
+        interest: Interest,
+        op: impl FnOnce(&socket2::Socket) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut op = Some(op);
+        let result = self.inner.try_io(interest, |socket| {
+            op.take().expect("the operation runs at most once")(socket)
+        });
+        match op {
+            Some(op) => op(self.inner.get_ref()),
+            None => result,
+        }
     }
 
     /// Attempt a non-blocking send. Returns `WouldBlock` if the kernel
     /// buffer is full.
     pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.clear_readiness_on_would_block(Interest::WRITABLE, self.inner.get_ref().send(buf))
+        self.nonblocking(Interest::WRITABLE, |socket| socket.send(buf))
     }
 
     /// Attempt a non-blocking send to a target address.
     pub fn try_send_to(&self, buf: &[u8], target: &SocketAddr) -> io::Result<usize> {
         let addr = SockAddr::from(*target);
-        self.clear_readiness_on_would_block(
-            Interest::WRITABLE,
-            self.inner.get_ref().send_to(buf, &addr),
-        )
+        self.nonblocking(Interest::WRITABLE, |socket| socket.send_to(buf, &addr))
     }
 
     /// Attempt a non-blocking receive. Returns `WouldBlock` if no data
     /// is available.
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.get_ref().recv(Self::as_uninit(buf));
-        self.clear_readiness_on_would_block(Interest::READABLE, n)
-    }
-
-    fn clear_readiness_on_would_block<T>(
-        &self,
-        interest: Interest,
-        result: io::Result<T>,
-    ) -> io::Result<T> {
-        if matches!(&result, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
-            self.clear_readiness(interest);
-        }
-        result
+        self.nonblocking(Interest::READABLE, |socket| {
+            socket.recv(Self::as_uninit(buf))
+        })
     }
 
     fn chunk_as_uninit(dst: &mut bytes::buf::UninitSlice) -> &mut [MaybeUninit<u8>] {
@@ -350,7 +354,52 @@ impl UdpSocket {
 #[cfg(test)]
 mod tests {
     use super::{RECV_INTEREST, UdpSocket};
+    use std::future::Future;
+    use std::io;
     use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::{Duration, Instant};
+
+    use tokio::io::Interest;
+
+    /// Poll `future` to completion on the calling thread, parking it between
+    /// polls. The test below has to wait for a readiness event the driver
+    /// publishes from inside a synchronous operation, a position no `await`
+    /// reaches. `budget` bounds that wait, so a publication that never arrives
+    /// fails the test instead of hanging it.
+    fn block_on<F: Future>(future: F, budget: Duration) -> Option<F::Output> {
+        struct Unpark(std::thread::Thread);
+        impl Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return Some(value);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            std::thread::park_timeout(deadline - now);
+        }
+    }
+
+    /// Whether an `AsyncFd` readiness event for `interest` is cached. The probe
+    /// does not consume the event: `try_io` only clears when the operation it
+    /// runs reports `WouldBlock`.
+    fn is_cached(socket: &UdpSocket, interest: Interest) -> bool {
+        socket
+            .async_fd()
+            .try_io(interest, |_| -> io::Result<()> { Ok(()) })
+            .is_ok()
+    }
 
     /// The async receive must await `ERROR` as well as `READABLE`: a pending
     /// `SO_ERROR` is a distinct error readiness bit on some platforms, and a
@@ -386,6 +435,113 @@ mod tests {
             None,
             "the bounded retry budget must be exhausted after {} would-blocks",
             expected.len()
+        );
+    }
+
+    /// A readiness event the driver publishes while a non-blocking operation
+    /// runs must survive the clear that the operation's `WouldBlock` triggers:
+    /// the event has already woken a waiter, and that waiter must still find the
+    /// socket readable.
+    ///
+    /// In production the gap between the failing syscall and the clear is a
+    /// handful of instructions, so the race is staged instead of sampled. The
+    /// operation (1) consumes the datagram that armed the cached event, (2) fails
+    /// a real syscall on an honestly empty queue — dropping that cached event —
+    /// then (3) publishes a second datagram and waits, over the same readiness
+    /// path the socket's own waiters use, for the driver to announce it. A clear
+    /// armed with the event observed *before* the operation leaves the newer
+    /// event cached; a clear armed with the event observed after the operation
+    /// consumes it, and the reader parked behind it never sees the datagram.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn a_would_block_clear_keeps_an_event_published_while_the_operation_ran() {
+        const BUDGET: Duration = Duration::from_secs(5);
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let socket = UdpSocket::bind(bind).await.unwrap();
+        let peer = std::net::UdpSocket::bind(bind).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let mut buf = [0u8; 16];
+
+        // The datagram whose arrival makes the driver publish the event the
+        // operation captures.
+        peer.send_to(b"first", addr).unwrap();
+        block_on(socket.readable(), BUDGET)
+            .expect("the driver never published the first datagram")
+            .unwrap();
+        assert!(
+            is_cached(&socket, Interest::READABLE),
+            "READABLE must be cached before the operation runs"
+        );
+
+        let result: io::Result<usize> = socket.nonblocking(Interest::READABLE, |_| {
+            // 1. Consume the datagram that armed the captured event.
+            assert_eq!(socket.try_recv(&mut buf).unwrap(), 5);
+            // 2. A real failing syscall on an honestly empty queue. Its
+            //    `WouldBlock` is what this operation reports, and it drops the
+            //    captured event so that a fresh waiter can park below.
+            assert_eq!(
+                socket.try_recv(&mut buf).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            // 3. Announce a second datagram while the operation is still
+            //    running, and park until the driver publishes its event.
+            peer.send_to(b"second", addr).unwrap();
+            block_on(socket.readable(), BUDGET)
+                .expect("the driver never published the second datagram")
+                .unwrap();
+            Err(io::ErrorKind::WouldBlock.into())
+        });
+        assert_eq!(
+            result.unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "the operation must report the failing syscall's error"
+        );
+
+        assert!(
+            is_cached(&socket, Interest::READABLE),
+            "the clear consumed a readiness event the driver published while the operation ran"
+        );
+        let n = tokio::time::timeout(BUDGET, socket.recv(&mut buf))
+            .await
+            .expect("the reader parked on a readiness event that was consumed")
+            .unwrap();
+        assert_eq!(&buf[..n], b"second");
+    }
+
+    /// A non-blocking operation that reports `WouldBlock` must drop the readiness
+    /// event it was armed with, so a later `writable()`/`readable()` await parks
+    /// instead of returning immediately off the stale cache.
+    ///
+    /// The socket-level `*_stops_claiming_*` tests can only drive that through the
+    /// kernel where the kernel genuinely backpressures a UDP send, which macOS
+    /// loopback never does; supplying the failing operation directly holds on every
+    /// platform.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn a_failing_operation_drops_the_event_it_was_armed_with() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let socket = UdpSocket::bind(bind).await.unwrap();
+        block_on(socket.writable(), Duration::from_secs(5))
+            .expect("the driver never published WRITABLE")
+            .unwrap();
+        assert!(
+            is_cached(&socket, Interest::WRITABLE),
+            "WRITABLE must be cached before the operation runs"
+        );
+
+        let result: io::Result<usize> =
+            socket.nonblocking(
+                Interest::WRITABLE,
+                |_| Err(io::ErrorKind::WouldBlock.into()),
+            );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "the operation's error must reach the caller"
+        );
+        assert!(
+            !is_cached(&socket, Interest::WRITABLE),
+            "a failing operation must drop the readiness event it was armed with"
         );
     }
 

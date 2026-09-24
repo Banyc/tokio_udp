@@ -12,6 +12,13 @@
 /// `sendmsg(2)` for zero-copy vectored sends. On other platforms it wraps
 /// `tokio::net::UdpSocket` and falls back to concatenation for vectored
 /// sends.
+///
+/// Every asynchronous method is cancel-safe. The syscall for one datagram runs
+/// inside a single poll and the future then completes, so a datagram is never
+/// split across an await point: dropping a `recv*` loses no datagram, and
+/// dropping a `send*` sends no datagram. `readable`/`writable` report the cached
+/// kernel readiness without consuming it; that cached event is dropped only when
+/// a receive or a send observes `WouldBlock`.
 pub use platform::UdpSocket;
 
 mod platform;
@@ -286,7 +293,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
-    async fn a_would_block_try_send_stops_claiming_the_socket_is_writable() {
+    async fn try_send_and_writability_stay_consistent_under_a_clamped_send_buffer() {
         let bind = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = UdpSocket::bind(bind).await.unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -334,8 +341,12 @@ mod tests {
                 "writable() returned with the send buffer still full"
             );
         } else {
-            // Kernel never backpressured: the socket is genuinely writable,
-            // so writable() must complete rather than report not-writable.
+            // Kernel never backpressured, so the `WouldBlock` arm this test exists
+            // for cannot be reached here: macOS loopback drops a datagram instead of
+            // filling a UDP send buffer, so the socket stays genuinely writable and
+            // `writable()` must say so. The clear itself is pinned on this platform
+            // by `platform::unix::tests`
+            // `a_failing_operation_drops_the_event_it_was_armed_with`.
             tokio::time::timeout(std::time::Duration::from_millis(200), client.writable())
                 .await
                 .expect("socket is writable but writable() never returned")
