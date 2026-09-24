@@ -461,6 +461,71 @@ mod tests {
         assert_eq!(src, client.local_addr().unwrap());
     }
 
+    /// A `BufMut` receive must do the syscall and the buffer commit in the *same*
+    /// poll: the crate's contract is that dropping a `recv*` loses no datagram,
+    /// and an await point between the two would let a future dropped there consume
+    /// a datagram from the kernel without ever committing its bytes. With read
+    /// readiness already cached the receive has nothing left to await, so its
+    /// first poll must return `Ready`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn recv_buf_commits_in_the_poll_that_reads_the_datagram() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+
+        let server = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind(bind).await.unwrap();
+        client
+            .send_to_vectored(&[std::io::IoSlice::new(b"hello")], &server_addr)
+            .await
+            .unwrap();
+        server.readable().await.unwrap();
+        let (n, buf) = {
+            let mut buf = bytes::BytesMut::with_capacity(64);
+            let n = {
+                let mut recv = std::pin::pin!(server.recv_buf(&mut buf));
+                match std::future::poll_fn(|cx| std::task::Poll::Ready(recv.as_mut().poll(cx)))
+                    .await
+                {
+                    std::task::Poll::Ready(result) => result.unwrap(),
+                    std::task::Poll::Pending => {
+                        panic!("recv_buf did not complete in the poll that performed the syscall")
+                    }
+                }
+            };
+            (n, buf)
+        };
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..], b"hello");
+
+        let server = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind(bind).await.unwrap();
+        client
+            .send_to_vectored(&[std::io::IoSlice::new(b"world")], &server_addr)
+            .await
+            .unwrap();
+        server.readable().await.unwrap();
+        let (n, src, buf) = {
+            let mut buf = bytes::BytesMut::with_capacity(64);
+            let (n, src) = {
+                let mut recv = std::pin::pin!(server.recv_buf_from(&mut buf));
+                match std::future::poll_fn(|cx| std::task::Poll::Ready(recv.as_mut().poll(cx)))
+                    .await
+                {
+                    std::task::Poll::Ready(result) => result.unwrap(),
+                    std::task::Poll::Pending => panic!(
+                        "recv_buf_from did not complete in the poll that performed the syscall"
+                    ),
+                }
+            };
+            (n, src, buf)
+        };
+        assert_eq!(n, 5);
+        assert_eq!(src, client.local_addr().unwrap());
+        assert_eq!(&buf[..], b"world");
+    }
+
     /// `try_clone_std` must return another handle to the *same* OS socket, not a
     /// fresh one: the clone shares the local address, the connected peer, and the
     /// send path, so a datagram sent through it leaves from the original address.
