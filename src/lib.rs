@@ -113,6 +113,40 @@ mod tests {
         }
     }
 
+    /// `bind` must choose the socket domain from the address family: binding an
+    /// IPv6 address on an IPv4 socket (or the reverse) fails, so a listener
+    /// configured on `[::]`/`[::1]` would never come up. The rest of the suite
+    /// only ever binds `127.0.0.1`, leaving the IPv6 arm unexercised.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn ipv6_sockets_bind_and_round_trip() {
+        let bind = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0));
+        let server = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        assert!(server_addr.is_ipv6());
+        let client = UdpSocket::bind(bind).await.unwrap();
+        client.connect(server_addr).await.unwrap();
+
+        let mut server_task = tokio::task::JoinSet::new();
+        server_task.spawn(async move {
+            let mut buf = [0u8; 64];
+            let (_n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let reply = b"v6";
+            server
+                .send_to_vectored(&[std::io::IoSlice::new(&reply[..])], &peer)
+                .await
+                .unwrap();
+        });
+
+        client.send(b"ping6").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = client.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"v6");
+        while let Some(result) = server_task.join_next().await {
+            result.unwrap();
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn send_to_vectored_recv_from() {
