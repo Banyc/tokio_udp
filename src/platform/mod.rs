@@ -1,7 +1,7 @@
 #[cfg(unix)]
 mod unix;
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), test))]
 mod fallback;
 
 #[cfg(unix)]
