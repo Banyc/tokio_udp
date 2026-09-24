@@ -404,8 +404,10 @@ mod tests {
     /// The async receive must await `ERROR` as well as `READABLE`: a pending
     /// `SO_ERROR` is a distinct error readiness bit on some platforms, and a
     /// receive that awaits only `READABLE` parks forever there instead of
-    /// surfacing the error. This pins the guarded property directly, so it
-    /// fails on every platform if `ERROR` is dropped from the wait.
+    /// surfacing the error. This pins the constant the receive paths are armed
+    /// with; the end-to-end property is pinned by `recv_surfaces_a_pending_so_error`
+    /// only where an error is not folded into read readiness (Linux), and is
+    /// unobservable on macOS, where a pending `SO_ERROR` also sets read readiness.
     #[test]
     fn recv_interest_surfaces_a_pending_error() {
         assert!(RECV_INTEREST.is_readable(), "recv must await READABLE");
