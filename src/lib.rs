@@ -427,6 +427,46 @@ mod tests {
         assert_eq!(src, client.local_addr().unwrap());
     }
 
+    /// `try_clone_std` must return another handle to the *same* OS socket, not a
+    /// fresh one: the clone shares the local address, the connected peer, and the
+    /// send path, so a datagram sent through it leaves from the original address.
+    /// `rtp`'s probe-echo responder sends its replies through exactly such a
+    /// clone; a clone that were a newly bound socket would answer from an
+    /// ephemeral port the prober does not recognise, and the echo round-trips
+    /// (`rtp`'s `listener_echoes_probe_with_direction_flipped` and friends) would
+    /// time out.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn try_clone_std_shares_the_socket_and_its_peer() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let a = UdpSocket::bind(bind).await.unwrap();
+        let b = UdpSocket::bind(bind).await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+        a.connect(b_addr).await.unwrap();
+
+        let clone = a.try_clone_std().unwrap();
+        assert_eq!(
+            clone.local_addr().unwrap(),
+            a_addr,
+            "the clone must share the original socket's local address"
+        );
+        assert_eq!(
+            clone.peer_addr().unwrap(),
+            b_addr,
+            "the clone must share the original socket's connected peer"
+        );
+
+        clone.send(b"clone").unwrap();
+        let mut buf = [0u8; 32];
+        let (n, src) = b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"clone");
+        assert_eq!(
+            src, a_addr,
+            "a datagram sent through the clone must leave from the original address"
+        );
+    }
+
     /// Whether vectored sends avoid the temporary concatenation is a
     /// per-platform backend decision; on Unix the `sendmsg(2)` backend reports
     /// `true` and the Windows fallback reports `false`.
