@@ -616,6 +616,133 @@ mod tests {
         assert_eq!(&buf[..], b"world");
     }
 
+    /// A destination smaller than the datagram is the receive-side counterpart of
+    /// the multi-buffer send: the kernel hands over exactly `buf.len()` bytes,
+    /// discards the datagram's excess, and keeps the next datagram's boundary.
+    /// Every other receive arm here gives the kernel a buffer *larger* than its
+    /// datagram, where the reported count, the bytes delivered and the datagram
+    /// length coincide — so a receive path that reported the datagram length while
+    /// delivering only `buf.len()` bytes, or that re-queued the truncated tail as
+    /// another datagram, passes all of them. Two datagrams from two distinct
+    /// senders are queued before the short read, so the surviving datagram's
+    /// payload *and* source distinguish it from the first and from its tail.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn a_short_buffer_delivers_exactly_its_bytes_and_leaves_the_next_datagram_intact() {
+        const DATAGRAM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let server = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind(bind).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let other = UdpSocket::bind(bind).await.unwrap();
+        let other_addr = other.local_addr().unwrap();
+
+        client
+            .send_to_vectored(&[std::io::IoSlice::new(DATAGRAM)], &server_addr)
+            .await
+            .unwrap();
+        // Establish that the first datagram is queued before the second is sent,
+        // so the order the two sockets' datagrams arrive in is not a race.
+        server.readable().await.unwrap();
+        other
+            .send_to_vectored(&[std::io::IoSlice::new(b"Z")], &server_addr)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 4];
+        let n = server.recv(&mut buf).await.unwrap();
+        assert_eq!(
+            n,
+            buf.len(),
+            "a short read reports the bytes it delivered, not the datagram length"
+        );
+        assert_eq!(&buf[..n], b"ABCD", "the first bytes of the first datagram");
+
+        // The second datagram must arrive whole and from its own sender: a path
+        // that re-queued the truncated tail would return "EFGH" from `client`.
+        let (n, src) = server.recv_from(&mut buf).await.unwrap();
+        assert_eq!(n, 1, "the surviving datagram keeps its own boundary");
+        assert_eq!(&buf[..n], b"Z");
+        assert_eq!(src, other_addr, "the source is that datagram's own sender");
+
+        // A third datagram from the first sender proves the reported address is
+        // read per datagram rather than cached from either earlier one.
+        client
+            .send_to_vectored(&[std::io::IoSlice::new(b"Q")], &server_addr)
+            .await
+            .unwrap();
+        let (n, src) = server.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"Q");
+        assert_eq!(src, client_addr, "the source follows the datagram");
+
+        assert!(
+            matches!(
+                server.try_recv(&mut buf),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "the discarded tail must not reappear as a datagram"
+        );
+    }
+
+    /// `recv_buf`/`recv_buf_from` write into a `BufMut`'s *spare* capacity and
+    /// report the bytes read, appending after whatever the caller already
+    /// committed. The rest of the suite only ever receives into a fresh
+    /// zero-length `BytesMut`, where the read count and the buffer's length after
+    /// the commit are one number; a spare capacity smaller than the datagram
+    /// separates them, and a prefix that must survive separates "append" from
+    /// "write at the start". The excess is discarded, so the next datagram is
+    /// intact.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn recv_buf_fills_only_the_spare_capacity_and_keeps_the_existing_prefix() {
+        const DATAGRAM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let server = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind(bind).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let mut buf = bytes::BytesMut::with_capacity(4);
+        buf.extend_from_slice(b"x");
+        let spare = buf.capacity() - buf.len();
+        assert!(
+            spare < DATAGRAM.len(),
+            "the destination must be smaller than the datagram: spare {spare}"
+        );
+        client
+            .send_to_vectored(&[std::io::IoSlice::new(DATAGRAM)], &server_addr)
+            .await
+            .unwrap();
+        let n = server.recv_buf(&mut buf).await.unwrap();
+        assert_eq!(n, spare, "a short read reports the bytes it delivered");
+        assert_eq!(buf.len(), 1 + spare);
+        assert_eq!(&buf[..1], b"x", "the prefix must survive the receive");
+        assert_eq!(
+            &buf[1..],
+            &DATAGRAM[..spare],
+            "the receive fills the spare capacity with the datagram's head"
+        );
+
+        client
+            .send_to_vectored(&[std::io::IoSlice::new(b"Z")], &server_addr)
+            .await
+            .unwrap();
+        let mut buf = bytes::BytesMut::with_capacity(8);
+        buf.extend_from_slice(b"y");
+        let (n, src) = server.recv_buf_from(&mut buf).await.unwrap();
+        assert_eq!(n, 1, "the surviving datagram keeps its own boundary");
+        assert_eq!(&buf[..], b"yZ");
+        assert_eq!(src, client_addr);
+        assert!(
+            matches!(
+                server.try_recv(&mut buf[..]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "the discarded tail must not reappear as a datagram"
+        );
+    }
+
     /// `try_clone_std` must return another handle to the *same* OS socket, not a
     /// fresh one: the clone shares the local address, the connected peer, and the
     /// send path, so a datagram sent through it leaves from the original address.
