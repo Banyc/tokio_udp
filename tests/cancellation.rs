@@ -86,6 +86,18 @@ async fn until(counter: &AtomicUsize, target: usize) {
     }
 }
 
+/// Poll a pinned future once on the calling task's context and leave it alive.
+/// `Some` when that poll completed, `None` when it is parked — the caller keeps
+/// the future, so what happens *while* it is parked can be staged.
+async fn poll_once_pending<F: std::future::Future>(
+    mut future: std::pin::Pin<&mut F>,
+) -> Option<F::Output> {
+    match std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await {
+        std::task::Poll::Ready(value) => Some(value),
+        std::task::Poll::Pending => None,
+    }
+}
+
 /// One datagram a receive committed: its sender tag, its per-sender sequence
 /// number, and the source address the receive reported — `None` for the
 /// synchronous `try_recv`, which has no source-address form.
@@ -117,9 +129,11 @@ struct Progress {
 /// deterministic by [`until`] in the caller — then cycles through the receive
 /// forms a cancellation bug can hide in: a future dropped after a single poll,
 /// a future cancelled by a short `timeout`, a `try_recv` that can clear the
-/// cached event, and a bare `readable()` await that only observes it. Every
-/// datagram it commits is recorded, until `wanted` datagrams are shared across
-/// all readers.
+/// cached event, a bare `readable()` await that only observes it, and a receive
+/// armed by `readable()` and then polled once and dropped, which is the poll
+/// that must both perform the syscall and complete the future. Every datagram
+/// it commits is recorded, until `wanted` datagrams are shared across all
+/// readers.
 ///
 /// A reader records a datagram only when a poll committed it, so the shared
 /// record is an exact accounting: a datagram whose syscall ran but whose future
@@ -149,7 +163,7 @@ async fn cancel_reader(
         if got.lock().unwrap().len() >= wanted {
             return;
         }
-        let committed = match step % 4 {
+        let committed = match step % 5 {
             0 => match poll_once_dropping(server.recv_from(&mut buf)).await {
                 Some(result) => {
                     let (n, src) = result.unwrap();
@@ -184,10 +198,39 @@ async fn cancel_reader(
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
                 Err(e) => panic!("try_recv: {e}"),
             },
-            _ => {
+            // A bare readiness observation: it consumes nothing, so it only
+            // tells the driver the socket was looked at while the other forms
+            // were dropping futures around it.
+            3 => {
                 let _ = tokio::time::timeout(probe, server.readable()).await;
                 progress.readable.fetch_add(1, Ordering::Relaxed);
                 None
+            }
+            _ => {
+                // Arm readiness, then poll a receive once and drop it. With the
+                // event already published the poll has nothing left to await,
+                // so it must commit the datagram it takes in that same poll;
+                // a path that consumes it and stays pending loses it here.
+                if tokio::time::timeout(probe, server.readable())
+                    .await
+                    .is_err()
+                {
+                    progress.readable.fetch_add(1, Ordering::Relaxed);
+                    None
+                } else {
+                    match poll_once_dropping(server.recv_from(&mut buf)).await {
+                        Some(result) => {
+                            let (n, src) = result.unwrap();
+                            assert_eq!(n, DATAGRAM_LEN, "a receive returned a partial datagram");
+                            let (sender, seq) = decode(&buf);
+                            Some((sender, seq, Some(src)))
+                        }
+                        None => {
+                            progress.parked_drops.fetch_add(1, Ordering::Relaxed);
+                            None
+                        }
+                    }
+                }
             }
         };
         if let Some(datum) = committed {
@@ -195,6 +238,121 @@ async fn cancel_reader(
         }
         step = step.wrapping_add(1);
         tokio::task::yield_now().await;
+    }
+}
+
+/// The receive-side counterpart of the lib test that pins `recv_buf`'s syscall
+/// and buffer commit to a single poll, and the shape that makes a lost-datagram
+/// bug red *deterministically* rather than only when a racing schedule happens
+/// to hit the window.
+///
+/// The receive-side counterpart of the lib test that pins `recv_buf`'s syscall
+/// and buffer commit to a single poll, and the shape that makes a lost-datagram
+/// bug red *deterministically* rather than only when a racing schedule happens
+/// to hit the window.
+///
+/// A cancellable receive has exactly two legal outcomes for the one poll it is
+/// given: it completes, having performed the syscall and committed the datagram
+/// it took, or it stays parked, having consumed nothing. The illegal third — a
+/// syscall performed into a future that is then dropped, so the datagram is in
+/// nobody's hands — is what this asserts against, and it is asserted in both
+/// directions: a poll that completed must deliver exactly the datagram that was
+/// sent, and a poll that stayed parked must leave that datagram for the next
+/// reader.
+///
+/// Readiness is awaited before the poll, which on a correct implementation also
+/// proves the datagram has landed (the kernel is what publishes the event). The
+/// assertion deliberately does not depend on that: it is the parked arm, not the
+/// arming, that carries the property.
+///
+/// Both single-buffer primitives are driven, because they are separate paths
+/// through the backend (`recv` and `recv_from` each have their own uninit
+/// wrapper) and a split introduced in one of them is invisible to the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn a_receive_dropped_mid_poll_has_consumed_no_datagram() {
+    const ROUNDS: u8 = 4;
+    const BOUND: Duration = Duration::from_secs(5);
+
+    #[derive(Clone, Copy)]
+    enum Form {
+        Recv,
+        RecvFrom,
+    }
+
+    let server = UdpSocket::bind(loopback()).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let peer = UdpSocket::bind(loopback()).await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+
+    let mut buf = [0u8; DATAGRAM_LEN];
+    for (form, round) in [Form::Recv, Form::RecvFrom]
+        .into_iter()
+        .flat_map(|form| (0..ROUNDS).map(move |round| (form, round)))
+    {
+        let payload = datagram(0, round);
+        peer.send_to_vectored(&[IoSlice::new(&payload)], &server_addr)
+            .await
+            .unwrap();
+        tokio::time::timeout(BOUND, server.readable())
+            .await
+            .unwrap_or_else(|_| panic!("HANG: round {round}: the arrival was never announced"))
+            .unwrap();
+        let completed: Option<(usize, Option<SocketAddr>)> = match form {
+            Form::Recv => poll_once_dropping(server.recv(&mut buf))
+                .await
+                .map(|taken| (taken.unwrap(), None)),
+            Form::RecvFrom => poll_once_dropping(server.recv_from(&mut buf))
+                .await
+                .map(|taken| {
+                    let (n, src) = taken.unwrap();
+                    (n, Some(src))
+                }),
+        };
+        if let Some((n, src)) = completed {
+            // The poll that performed the syscall must have committed its
+            // result, so a dropped future has already handed the datagram over.
+            assert_eq!(n, DATAGRAM_LEN, "round {round}: a partial datagram");
+            assert_eq!(
+                src,
+                match form {
+                    Form::Recv => None,
+                    Form::RecvFrom => Some(peer_addr),
+                },
+                "round {round}: `recv` has no source-address form, `recv_from` reports its own sender"
+            );
+            assert_eq!(
+                &buf[..n],
+                &payload,
+                "round {round}: the completing poll must deliver exactly the datagram sent"
+            );
+        } else {
+            // The parked poll must have consumed nothing, so the datagram is
+            // still there for the next reader.
+            let (n, src) = tokio::time::timeout(BOUND, server.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "HANG: round {round}: a single poll that did not complete the future had \
+                         already consumed the datagram, so it is in nobody's hands and a correct \
+                         reader waits forever on an empty socket"
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                &buf[..n],
+                &payload,
+                "round {round}: the parked poll took nothing"
+            );
+            assert_eq!(src, peer_addr, "round {round}: its own sender");
+        }
+        assert!(
+            matches!(
+                server.try_recv(&mut buf),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "round {round}: the round sent one datagram and it must have been taken exactly once"
+        );
     }
 }
 
@@ -239,23 +397,27 @@ fn conserve(
 /// parking behind a consumed event) and still be deliverable (`recv_from`
 /// returns it, from its own sender).
 ///
-/// The drain at the end of every round is the other direction of the same latch,
-/// and it is race-free *because of* the order above: awaiting `readable` is what
-/// proves the driver's event for that arrival has landed, so by the time the
-/// datagram has been consumed and `try_recv` reports `WouldBlock` there is no
-/// publish still in flight for the clear to lose to. A latch left claimed by an
-/// empty socket would make every later reader poll through a spurious wakeup;
-/// the final assertion is that it was dropped.
+/// The drop is the *only* thing between the two `readable` awaits, and the first
+/// one is what makes the second a property rather than a race: awaiting
+/// `readable` proves the driver's event for that arrival has already landed, so
+/// a park after the drop can only mean the drop consumed it. The drain at the
+/// end of every round is the other direction of the same latch: once the kernel
+/// queue is empty the cached event must have been dropped, so `readable` must
+/// park rather than answer off the event the just-drained datagram armed. That
+/// arm is race-free for the same reason — the arrival's publish has landed
+/// before the clear.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn a_receive_dropped_while_parked_leaves_the_late_datagram_queued_and_announced() {
     const ROUNDS: u8 = 8;
     const BOUND: Duration = Duration::from_secs(5);
-    /// Long enough that a genuinely parked `readable` cannot be woken inside it
-    /// on a busy host, short enough not to dominate the default tier's cost. A
-    /// latch left claimed by the drain below answers in microseconds, so this
-    /// bound is not what decides that arm.
-    const NOT_READABLE: Duration = Duration::from_millis(150);
+    /// A latch left claimed by the drain answers in microseconds and a parked
+    /// `readable` cannot be woken without an arrival, so this bound is set by
+    /// what it costs rather than by what it catches: a shorter bound makes the
+    /// arm strictly stronger, since a stale latch answers long before any bound
+    /// this small, and every millisecond of it is a millisecond of default-tier
+    /// time spent waiting for a timeout that has to expire.
+    const NOT_READABLE: Duration = Duration::from_millis(25);
 
     let server = UdpSocket::bind(loopback()).await.unwrap();
     let server_addr = server.local_addr().unwrap();
@@ -265,10 +427,11 @@ async fn a_receive_dropped_while_parked_leaves_the_late_datagram_queued_and_anno
     let mut buf = [0u8; DATAGRAM_LEN];
     for round in 0..ROUNDS {
         let payload = datagram(0, round);
+        // Boxed, so that the `drop` below drops the future itself rather than a
+        // pinned reference to one that would live to the end of the scope.
+        let mut receive = Box::pin(server.recv_from(&mut buf));
         assert!(
-            poll_once_dropping(server.recv_from(&mut buf))
-                .await
-                .is_none(),
+            poll_once_pending(receive.as_mut()).await.is_none(),
             "round {round}: the socket must start empty, so the receive parks in this poll"
         );
         // The datagram arrives after the receive registered its interest and
@@ -278,10 +441,16 @@ async fn a_receive_dropped_while_parked_leaves_the_late_datagram_queued_and_anno
             .unwrap();
         tokio::time::timeout(BOUND, server.readable())
             .await
+            .unwrap_or_else(|_| panic!("HANG: round {round}: the arrival was never announced"))
+            .unwrap();
+        drop(receive);
+        tokio::time::timeout(BOUND, server.readable())
+            .await
             .unwrap_or_else(|_| {
                 panic!(
-                    "HANG: round {round}: the arrival's readiness event was consumed by the dropped \
-                     receive, so a reader parks in front of a datagram that is already queued"
+                    "HANG: round {round}: dropping the parked receive consumed the readiness event \
+                     the arrival had already published, so a reader parks in front of a datagram \
+                     that is already queued"
                 )
             })
             .unwrap();
