@@ -458,6 +458,40 @@ mod tests {
         assert_eq!(&buf[..n], b"probe");
     }
 
+    /// `try_send_to` must put the datagram on the wire addressed to its `target`
+    /// argument, sent from this socket. Nothing else drives it: the rest of the
+    /// suite reaches it only through the API-parity shim, so a `try_send_to` that
+    /// dropped the target and issued the connected `send(2)` — or addressed the
+    /// wrong peer — reached the peer never and left the suite green. The sender is
+    /// deliberately *unconnected*, so dropping the target fails with
+    /// `EDESTADDRREQ` instead of silently landing somewhere valid, and the peer
+    /// checks both the payload and that the source is this socket.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn try_send_to_addresses_its_target_argument() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let server = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind(bind).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        assert_eq!(client.try_send_to(b"targeted", &server_addr).unwrap(), 8);
+
+        let mut buf = [0u8; 32];
+        let (n, src) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.recv_from(&mut buf),
+        )
+        .await
+        .expect("try_send_to never delivered its datagram")
+        .unwrap();
+        assert_eq!(&buf[..n], b"targeted");
+        assert_eq!(
+            src, client_addr,
+            "the datagram must leave from the socket that sent it"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn set_and_read_ttl() {
