@@ -187,6 +187,62 @@ mod tests {
         assert_eq!(&buf[..n], b"hello world");
     }
 
+    /// The *connected* vectored arm — `send_vectored`, the one that passes no
+    /// target address — is a distinct path from `send_to_vectored`, and the rest
+    /// of the suite only ever drives it with a single-element `IoSlice` array.
+    /// A one-element array carries no multi-buffer information: a backend that
+    /// sent only the first buffer, or that reordered the iovec array, would pass
+    /// every one of them. The buffers here are distinguishable and of unequal
+    /// length, so a dropped buffer, a truncation or a reordering changes the
+    /// payload. A non-blocking receive straight after the payload must find
+    /// nothing queued: a backend that emitted one datagram per buffer, or the
+    /// datagram twice, enqueues every datagram before the first is dequeued, so
+    /// the extra one is already waiting and is reported instead of `WouldBlock`.
+    /// (That check is what the payload equality cannot see: a split truncates the
+    /// first datagram, but an exact duplicate does not.) The receive itself is
+    /// bounded so a datagram that never arrives fails rather than hangs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn send_vectored_delivers_every_buffer_of_a_connected_socket() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let server = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind(bind).await.unwrap();
+        client.connect(server_addr).await.unwrap();
+
+        let parts = [
+            std::io::IoSlice::new(b"one|"),
+            std::io::IoSlice::new(b"two|"),
+            std::io::IoSlice::new(b"three"),
+        ];
+        let total: usize = parts.iter().map(|part| part.len()).sum();
+        assert_eq!(total, 13, "three distinguishable, unequal-length buffers");
+        assert_eq!(client.send_vectored(&parts).await.unwrap(), total);
+
+        let mut buf = [0u8; 64];
+        let (n, src) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.recv_from(&mut buf),
+        )
+        .await
+        .expect("the connected vectored datagram never arrived")
+        .unwrap();
+        assert_eq!(src, client.local_addr().unwrap());
+        assert_eq!(n, total, "the reported length must cover every buffer");
+        assert_eq!(
+            &buf[..n],
+            b"one|two|three",
+            "a connected vectored send must deliver every buffer, in order"
+        );
+        assert!(
+            matches!(
+                server.try_recv(&mut buf),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "the buffers must travel as one datagram, not one datagram each"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn send_vectored_single_buffer_is_same_as_send() {
