@@ -175,6 +175,27 @@ scenario, so no report-only body can reach an asserting helper.
 ```gate-perf-guard-helpers
 ```
 
+## The env-scaled opt-in surface
+
+`TOKIO_UDP_SOAK_CYCLES` is the one surface of this crate that no `#[ignore]`
+set can show: whoever invokes the test reads it in-process, and no script here
+sets it, so it is invisible to every other block and the declaration below is
+its only record. The checker's `gate-env-tier` block enforces it in both
+directions — every variable the sources read must be declared, and every
+declared variable must be read — and refuses the `-` no-runner marker for a
+variable a script does set (`netem_test/tools/check-gate.py`). The row's
+`total` is **derived** from the surface's own variable
+(`TOKIO_UDP_SOAK_CYCLES*32`, the per-cycle datagram count being the fixed
+`SENDERS*PER_SENDER`) rather than restated beside it; its `wall` is
+**measured** — this crate's own best-of-five wall clock of the test binary at
+the default 300 cycles (0.27, 0.32, 0.31, 0.25, 0.28 s), the same 0.25 s the
+`standard` perf row above declares — and its `bound` is the rule-of-three
+detection limit that cycle count buys, stated in full under "Detection limit".
+
+```gate-env-tier
+soak-cycle-scale = TOKIO_UDP_SOAK_CYCLES | - | the opt-in cancellation soak's cycle count, read in-process by whoever invokes the test and set by no script of this crate, defaulting to 300 when unset: it sizes how many times the soak replays one fixed 32-datagram schedule family on a socket pair bound once and reused, so aggregate exposure is bought with cycles and never with per-cycle size; the arm it scales is asserting and not report-only — every cycle asserts each of its 32 datagrams is committed exactly once, that none is left queued after the accounting closes, and that no cycle failed to complete within its 2 s hang bound, with a 250 ms overrun counted and printed as a host-latency late and never as a catch — and its tier is the harness's `standard` for an asserting opt-in (`tests/cancellation.rs:675`), whose `#[ignore]` reason names the default tier's bounded form rather than this tier name | cancellation-conservation@readiness=armed+concurrency=concurrent+conservation=bulk+sustained=repeated, cancellation-conservation-rate@metric=rule-of-three+unit=cycle | TOKIO_UDP_SOAK_CYCLES=300,total=TOKIO_UDP_SOAK_CYCLES*32,wall=0.25s,bound=1.0e-2/cycle
+```
+
 ## Detection limit
 
 A zero-hit soak run of `N` cycles at 32 datagrams excludes a per-cycle
