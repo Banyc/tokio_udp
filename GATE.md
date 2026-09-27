@@ -84,6 +84,44 @@ cycle would be tens of thousands of binds and this host refuses binds with
 under test. No cycle can therefore lose a datagram to a refused bind, and the
 loss counter only moves when a receive failed to commit one.
 
+## The loopback delay this socket layer adds
+
+A deployed client reports a 190 ms **minimum** round trip where the harness's
+clean arm reports tens of milliseconds. A floor is a cost paid by essentially
+every datagram, so it is measured directly: `tests/loopback_delay.rs` runs a
+one-datagram-in-flight ping-pong on loopback — no datagram can queue behind
+another — and compares this crate's readiness path against a plain
+`std::net::UdpSocket` carrying the same echo. Syscall and copy counts are
+properties of the paths, stated rather than counted per datagram because macOS
+offers no unprivileged tracer: `send`/`recv*` issue one `sendmsg` and one
+`recvmsg` per datagram with two user/kernel copies, `std`'s
+`send_to`/`recv_from` issue one `sendto` and one `recvfrom` with two, and the
+concatenating vectored fallback adds a third userspace copy.
+
+Measured on the tree this file is committed with (`--release`, best of three):
+this crate's median 0.040 ms against `std`'s 0.023 ms — **0.017 ms of added cost
+over a blocking thread pair, 0.009 % of the field's floor** — with p99 0.081 ms.
+The concatenating fallback measures p50 0.032 ms but p99 1.03 ms, so the extra
+copy is an allocator cost in the tail rather than a toll on every datagram. The
+bound is a tripwire at 2 ms on the median, two orders of magnitude below the
+field number.
+
+The same file pins the one thing about this crate's socket that is knowingly
+unsized: `bind` calls `socket(2)` and `bind(2)` and sets **no** buffer size, so
+both directions run at the kernel defaults. Measured here: receive 786 896 B and
+send 9 216 B, identical to a plain `std` socket. That is a **loss ceiling, not a
+floor** — a socket buffer never delays a datagram it accepts, it can only drop
+one — and the burst arm measures the shape: 9 000 datagrams of 1 200 B offered
+with no reader keep 638 at the default size and 3 404 once the receive buffer is
+set to 4 MiB. On Linux an unsized socket's receive queue comes from
+`net.core.rmem_default` (`SKB_TRUESIZE(256) * 256`, `net/core/sock.h:3056-3059`)
+and a datagram is dropped with `UDP_MIB_RCVBUFERRORS` once the truesize-accounted
+queue exceeds it (`net/core/sock.h:1153-1158`, `net/ipv4/udp.c:2310-2324`), so
+the ceiling prices offered *load* — the opposite mechanism to a floor. The
+buffer sizes are therefore left to the caller: the value that matters is a path
+bandwidth-delay product, which the transport that knows its own send rate owns
+and a socket layer does not.
+
 ## Vacuity: the injections this gate is graded against
 
 Each injection is a transient edit to `src/platform/unix.rs`, reverted before
@@ -115,6 +153,9 @@ cancellation::cancelled_receive_soak_conserves_every_datagram = standard
 cancellation::a_receive_dropped_while_parked_leaves_the_late_datagram_queued_and_announced
 cancellation::a_receive_dropped_mid_poll_has_consumed_no_datagram
 cancellation::concurrent_cancelled_and_timed_out_receives_conserve_every_datagram
+loopback_delay::tokio_udp_adds_no_floor_over_a_plain_std_udp_socket
+loopback_delay::the_socket_buffers_are_left_at_the_kernel_defaults
+loopback_delay::a_burst_past_the_default_receive_buffer_is_a_loss_ceiling_not_a_floor
 ```
 
 The asserting set is every `standard`/`full` scenario plus every required
@@ -126,6 +167,9 @@ cancellation::a_receive_dropped_while_parked_leaves_the_late_datagram_queued_and
 cancellation::a_receive_dropped_mid_poll_has_consumed_no_datagram
 cancellation::concurrent_cancelled_and_timed_out_receives_conserve_every_datagram
 cancellation::cancelled_receive_soak_conserves_every_datagram
+loopback_delay::tokio_udp_adds_no_floor_over_a_plain_std_udp_socket
+loopback_delay::the_socket_buffers_are_left_at_the_kernel_defaults
+loopback_delay::a_burst_past_the_default_receive_buffer_is_a_loss_ceiling_not_a_floor
 ```
 
 ## Perf declaration and coverage
@@ -139,11 +183,12 @@ cancellation::a_receive_dropped_while_parked_leaves_the_late_datagram_queued_and
 cancellation::a_receive_dropped_mid_poll_has_consumed_no_datagram = default | 0.01 | orthogonal | cancellation-commit@readiness=armed+concurrency=single+conservation=witness
 cancellation::concurrent_cancelled_and_timed_out_receives_conserve_every_datagram = default | 0.01 | composite(readiness,concurrency,conservation,sustained) | cancellation-conservation@readiness=armed+concurrency=concurrent+conservation=bulk+sustained=one-shot
 cancellation::cancelled_receive_soak_conserves_every_datagram = standard | 0.25 | composite(readiness,concurrency,conservation,sustained) | cancellation-conservation@readiness=armed+concurrency=concurrent+conservation=bulk+sustained=repeated
+loopback_delay::tokio_udp_adds_no_floor_over_a_plain_std_udp_socket = default | 0.10 | composite(path,shape,reference) | socket-floor@path=readiness+shape=ping-pong+reference=plain-std-udp
+loopback_delay::the_socket_buffers_are_left_at_the_kernel_defaults = default | 0.01 | composite(name,state) | socket-option@name=so_rcvbuf_and_so_sndbuf+state=unsized
+loopback_delay::a_burst_past_the_default_receive_buffer_is_a_loss_ceiling_not_a_floor = default | 0.15 | composite(path,load,size) | socket-loss@path=receive-queue+load=burst+size=default-vs-4MiB
 ```
 
-The declared sums are `default` 0.06 s and `standard` 0.25 s (measured 0.03 s
-and 0.24 s at 300 cycles). The default tier of the *crate* grows by the ~0.03 s
-this target costs on top of an unchanged 0.58 s lib tier; the parked test's
+The declared sums are `default` 0.32 s (0.06 s cancellation + 0.26 s loopback measurement, measured 0.10/0.01/0.15 s) and `standard` 0.25 s (measured 0.24 s at 300 cycles). The default tier of the *crate* grows by the ~0.26 s this measurement adds on top of an unchanged 0.58 s lib tier; the parked test's
 whole cost is its negative bound, held at 25 ms because a stale latch answers in
 microseconds and a shorter bound only makes the arm stronger.
 
@@ -167,6 +212,10 @@ cancellation-conservation@pillar=multicast-or-broadcast = the conservation law i
 cancellation-commit@readiness=armed+conservation=bulk = the armed single-poll arm is asserted at the witness scale (one datagram per round) and inside the concurrent row's reader cycle; there is no separate armed-only bulk arm, because the concurrent row's readers already take that shape.
 cancellation-commit@outcome=parked-with-datagram-queued = the parked arm is exercised whenever the arming wait returns before the platform has delivered the datagram (loopback delivery, not the readiness event, is what decides), so it is opportunistic on a correct implementation; staging it deterministically would mean reaching into the backend's own readiness state, which is what the lib-tier pin does instead.
 cancellation-latch@tier=full = the soak is `standard`; the `full` budget is declared so a heavier row cannot be added without one, not because a `full` row is missing.
+socket-floor@transport=impaired = this crate has no impairment instrument; loss, delay, reordering and rate shaping live in `netem_test` and the `rtp`/`rtp_mux` scenarios that compose this socket, not in a test that binds loopback directly.
+socket-floor@shape=pipelined = the floor arm keeps one datagram in flight so nothing can queue behind anything else; pipelining depths are measured in `udp_listener`'s dispatch sweep, which composes this socket.
+socket-loss@host=linux = the buffer sizes this arm reads are the host's, and the Linux default quoted above is read from the kernel source rather than measured on a Linux host, so the *magnitudes* of the two platforms' ceilings are not compared here.
+socket-floor@metric=syscall-count = macOS offers no unprivileged syscall tracer, so the syscall and copy counts are stated from the code paths and differenced by cost rather than counted per datagram.
 ```
 
 The `gate-perf-guard-helpers` block is empty: this crate has no `perf`-tier
