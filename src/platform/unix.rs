@@ -135,6 +135,54 @@ impl UdpSocket {
             .leave_multicast_v4(multi_addr, interface)
     }
 
+    /// Request a receive buffer size, in bytes.
+    ///
+    /// This is a **request, not a setting**: the kernel decides what the socket
+    /// gets. Linux clamps it to `net.core.rmem_max` (`net/core/sock.c:1375`) and
+    /// stores twice the accepted value, to account for the `skb` overhead the
+    /// receive queue is charged (`net/core/sock.c:987`), so a socket may run
+    /// with *less* than was asked for and reports *more* than was asked for.
+    /// Read [`recv_buffer_size`](Self::recv_buffer_size) back rather than
+    /// trusting this argument.
+    ///
+    /// `bind` sizes no buffer, so the default is the kernel's own. On Linux that
+    /// is `net.core.rmem_default` (`include/net/sock.h:3056-3059`), 212 992 B on
+    /// x86_64. That is a **loss ceiling**, not a cost paid per datagram: it is
+    /// the most a stalled reader can let accumulate before the kernel refuses
+    /// one (`net/ipv4/udp.c:1669-1679`), and a reliable transport pays a refusal
+    /// back a round trip later. A transport that knows its own send rate and its
+    /// path's round trip should size this to that product; this layer knows
+    /// neither, so it leaves the choice to its caller and documents the ceiling
+    /// rather than guessing one.
+    pub fn set_recv_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        self.inner.get_ref().set_recv_buffer_size(bytes)
+    }
+
+    /// The receive buffer size this socket is actually running with, in bytes —
+    /// the value the kernel accepted, which is not necessarily the value
+    /// requested.
+    pub fn recv_buffer_size(&self) -> io::Result<usize> {
+        self.inner.get_ref().recv_buffer_size()
+    }
+
+    /// Request a send buffer size, in bytes.
+    ///
+    /// The same request semantics and the same clamp apply as for
+    /// [`set_recv_buffer_size`](Self::set_recv_buffer_size); read
+    /// [`send_buffer_size`](Self::send_buffer_size) back for the truth. The send
+    /// buffer bounds how many bytes may be in flight in the kernel, so on a
+    /// long-RTT path it caps throughput at `buffer / rtt` independently of the
+    /// receive side: at the field's 190 ms round trip a 212 992 B send buffer
+    /// cannot push more than ~1.1 MB/s, whatever the link allows.
+    pub fn set_send_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        self.inner.get_ref().set_send_buffer_size(bytes)
+    }
+
+    /// The send buffer size this socket is actually running with, in bytes.
+    pub fn send_buffer_size(&self) -> io::Result<usize> {
+        self.inner.get_ref().send_buffer_size()
+    }
+
     /// Low-level [`AsyncFd`] access for registering custom readiness
     /// interests.
     pub fn async_fd(&self) -> &AsyncFd<socket2::Socket> {

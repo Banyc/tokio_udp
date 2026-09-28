@@ -74,6 +74,33 @@ impl UdpSocket {
         self.inner.leave_multicast_v4(*multi_addr, *interface)
     }
 
+    /// Request a receive buffer size, in bytes. The tokio socket this backend
+    /// wraps exposes no buffer sizing, so the wrapped descriptor is viewed
+    /// through `socket2` — the same option the Unix backend sets directly.
+    ///
+    /// The request semantics are the kernel's: it may clamp, and it may store a
+    /// different value than it was asked for, so
+    /// [`recv_buffer_size`](Self::recv_buffer_size) is the only honest answer.
+    pub fn set_recv_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        socket2::SockRef::from(&self.inner).set_recv_buffer_size(bytes)
+    }
+
+    /// The receive buffer size this socket is actually running with, in bytes.
+    pub fn recv_buffer_size(&self) -> io::Result<usize> {
+        socket2::SockRef::from(&self.inner).recv_buffer_size()
+    }
+
+    /// Request a send buffer size, in bytes. See
+    /// [`set_recv_buffer_size`](Self::set_recv_buffer_size).
+    pub fn set_send_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        socket2::SockRef::from(&self.inner).set_send_buffer_size(bytes)
+    }
+
+    /// The send buffer size this socket is actually running with, in bytes.
+    pub fn send_buffer_size(&self) -> io::Result<usize> {
+        socket2::SockRef::from(&self.inner).send_buffer_size()
+    }
+
     pub async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         match bufs.len() {
             0 => Ok(0),
@@ -291,7 +318,10 @@ mod tests {
     /// The option surface delegates to the tokio socket, and `try_clone_std`
     /// only has an answer where a borrowed handle can be duplicated: Windows
     /// duplicates it, every other platform refuses rather than hand back a
-    /// socket that is not the same one.
+    /// socket that is not the same one. The buffer sizing goes through a
+    /// `socket2` view of the same descriptor, so it must reach the kernel for
+    /// this backend too — a fallback whose sizing silently did nothing would
+    /// leave a caller that sized a socket for a long-RTT path unsized.
     #[tokio::test]
     async fn options_multicast_and_clone() {
         let sock = UdpSocket::bind(loopback()).await.unwrap();
@@ -302,6 +332,17 @@ mod tests {
         sock.set_broadcast(false).unwrap();
         assert!(!sock.broadcast().unwrap());
         sock.set_multicast_loop_v4(true).unwrap();
+
+        sock.set_recv_buffer_size(1 << 16).unwrap();
+        assert!(
+            sock.recv_buffer_size().unwrap() >= 1 << 16,
+            "the fallback's receive-buffer request did not reach the kernel"
+        );
+        sock.set_send_buffer_size(1 << 16).unwrap();
+        assert!(
+            sock.send_buffer_size().unwrap() >= 1 << 16,
+            "the fallback's send-buffer request did not reach the kernel"
+        );
 
         let group = Ipv4Addr::new(239, 255, 0, 1);
         sock.join_multicast_v4(&group, &Ipv4Addr::LOCALHOST)

@@ -125,12 +125,13 @@ transport that knows its own send rate owns and a socket layer does not. The
 section below measures what that ceiling costs and gives the caller the surface
 to act on it.
 
-## The raw receive buffer: what the ceiling costs
+## The raw receive buffer: what the ceiling costs, and the sizing surface it needs
 
 The arm above records that the default buffer is a *loss ceiling* rather than a
 floor. `tests/rcvbuf_cliff.rs` measures what that ceiling costs **at the rates
 this product offers** — the interactive lane's 256 B / 5 ms ≈ 51 KB/s and
-256 B / 25 ms ≈ 10 KB/s, and the bulk lane's 1 MiB/s, the rate the M3 arm offers.
+256 B / 25 ms ≈ 10 KB/s, and the bulk lane's 1 MiB/s, the rate the M3 arm offers
+— and decides the sizing question the earlier arm deliberately left open.
 
 All four arms were measured with `cargo test --release --locked --offline --test
 rcvbuf_cliff -- --ignored --nocapture --test-threads=1` on the tree this file is
@@ -196,8 +197,11 @@ it, with the receive buffer the only place a datagram can be lost:
 
 **Recovery cost = 490 ms - 297 ms = 193 ms = 1.01 x the path's round trip.** A
 refused datagram is not lost work, it is work deferred by one round trip, and on
-the field's path a transfer that has to recover 236 of 699 datagrams finishes in
+the field's path a transfer that has to recover ~236 of 699 datagrams finishes in
 2.6 round trips where the same transfer against a sized buffer finishes in 1.6.
+The offer is paced against wall clock, so the refused count moves by a couple of
+datagrams between runs (two runs measured 236 and 238) and the recovery cost does
+not (193 ms and 192 ms).
 That is the shape of the field's maxima: 1063 ms and 3205 ms are 5.6 and 16.9
 base round trips — multiples of the path, which is what a refusal recovered by a
 retransmission produces.
@@ -247,7 +251,7 @@ Linux cliff at the bulk lane's 873 datagrams/s is **~105–132 ms** of reader
 stall — *below* the field's 190 ms floor. Every depth measured in this file is an
 upper bound on the deployed target's, never a lower one.
 
-### The decision the measurement forces
+### The decision
 
 Both defaults are finite and both are smaller than the field path's bandwidth-delay
 product at any lane the product offers: at 1 MiB/s and a 190 ms round trip the
@@ -256,19 +260,39 @@ budget — the buffer cannot hold one round trip of the bulk lane, so a transfer
 above ~0.55–0.7 MiB/s on that path loses to the kernel whatever the link allows. The
 send side is the same shape: an unsized socket's send buffer bounds in-flight
 bytes at `wmem_default`, so on a 190 ms path it caps throughput at
-`212 992 / 190 ms ≈ 1.1 MB/s` independently of the receive side. **The size that
-matters is a path bandwidth-delay product, which this layer does not know** — it
-knows neither its path's round trip nor its transport's send rate — and the one
-lane the field's client actually runs is not implicated at all, since its own
-offered rate cannot fill the deployed budget in 500 ms of stall.
+`212 992 / 190 ms ≈ 1.1 MB/s` independently of the receive side.
+
+**This layer therefore exposes the sizing**, and leaves the default alone. Two
+halves, each with a reason:
+
+* `set_recv_buffer_size` / `recv_buffer_size` and `set_send_buffer_size` /
+  `send_buffer_size` are now public on `UdpSocket` (Unix backend on `socket2`,
+  the non-Unix fallback through a `socket2::SockRef` view of the same
+  descriptor, and the parity shim instantiates both). A caller that knows a path
+  bandwidth-delay product can now act on it through this crate's own API; the
+  only way before was `async_fd()`, which is Unix-only and hands back the backend.
+  The getters read the kernel, so the request-not-setting trap above — "we set
+  4 MiB and landed at 213 KiB" — is observable by the caller rather than silent.
+  On this host a 64 KiB request reads back 65 536 B, and a **1 GiB** request reads
+  back 8 388 608 B: the clamp is the host ceiling and the getter reports it.
+* The default stays the kernel's. A socket layer knows neither its path's round
+  trip nor its transport's send rate, so any constant it chose would be a guess
+  applied to every socket; and the interactive lane — the lane the field's client
+  actually runs — is **not implicated at all**, since its own offered rate cannot
+  fill the deployed budget in 500 ms of stall. The value that matters is a path
+  product, and the transport that owns those two numbers is where it belongs.
+
+Wiring the setters into that transport is the consuming change and is **not**
+made here, because `rtp` sits above this crate and is owned elsewhere.
 
 Each arm prints its own rows and asserts its own sanity. The assertions are: no
 refusals at a live reader at the mandate rates; the default queue is finite and a
 4 MiB request buys depth (the "the size did not reach the socket" tripwire); the
 `linux-default` budget refuses nothing at the interactive cadence and the 4 MiB
-control refuses nothing at any stall; and the 4 MiB control needs no repair over
-the emulated path while the deployed budget does, and that repair costs at least
-half a round trip.
+control refuses nothing at any stall; the 4 MiB control needs no repair over the
+emulated path while the deployed budget does, and that repair costs at least half
+a round trip; and the default tier's setter arm makes a setter that does not reach
+the kernel and a getter that echoes the request both red.
 
 ## Vacuity: the injections this gate is graded against
 
@@ -308,6 +332,7 @@ cancellation::concurrent_cancelled_and_timed_out_receives_conserve_every_datagra
 loopback_delay::tokio_udp_adds_no_floor_over_a_plain_std_udp_socket
 loopback_delay::the_socket_buffers_are_left_at_the_kernel_defaults
 loopback_delay::a_burst_past_the_default_receive_buffer_is_a_loss_ceiling_not_a_floor
+lib::tests::the_buffer_setters_report_what_the_kernel_accepted
 ```
 
 The asserting set is every `standard`/`full` scenario plus every required
@@ -326,6 +351,7 @@ rcvbuf_cliff::a_live_reader_drains_every_rate_the_product_offers
 rcvbuf_cliff::the_receive_capacity_in_datagrams_at_the_product_sizes
 rcvbuf_cliff::a_reader_stall_is_what_overflows_the_receive_buffer
 rcvbuf_cliff::a_refused_datagram_costs_a_path_round_trip
+lib::tests::the_buffer_setters_report_what_the_kernel_accepted
 ```
 
 ## Perf declaration and coverage
@@ -381,6 +407,7 @@ socket-stall@shape=consumer-stall = the stall is a reader that stops reading, wh
 socket-capacity@host=linux = the Linux depth is derived rather than measured; the derivation is stated with its arithmetic and its two citations in the section above, and every measured depth is an upper bound on it.
 socket-offer@lane=multiplexed = the sweep drives one socket, so several flows sharing one receiver is the composing transport's question and not a cell this crate can attribute.
 socket-repair@shape=consumer-stall = the refusal is staged by the reader's own stall on the emulated path, so this is a scheduling-stall shape rather than an arrival burst compressed by a bottleneck queue, and it says nothing about reordering.
+socket-capacity@stack=rtp = the setters are exposed but nothing in this crate calls them, so no cell here claims that a composed transport sizes its sockets; the default tier's arm claims only that a request reaches the kernel and that the getter reports what the kernel accepted.
 socket-floor@metric=syscall-count = macOS offers no unprivileged syscall tracer, so the syscall and copy counts are stated from the code paths and differenced by cost rather than counted per datagram.
 ```
 

@@ -45,6 +45,10 @@ async fn assert_api_parity(
     socket.set_multicast_loop_v4(true)?;
     socket.join_multicast_v4(&group, &group)?;
     socket.leave_multicast_v4(&group, &group)?;
+    socket.set_recv_buffer_size(1 << 16)?;
+    let _: usize = socket.recv_buffer_size()?;
+    socket.set_send_buffer_size(1 << 16)?;
+    let _: usize = socket.send_buffer_size()?;
     socket.readable().await?;
     socket.writable().await?;
     let _: usize = socket.send(buf).await?;
@@ -510,6 +514,89 @@ mod tests {
         assert!(sock.broadcast().unwrap());
         sock.set_broadcast(false).unwrap();
         assert!(!sock.broadcast().unwrap());
+    }
+
+    /// A buffer-size setter must not report success for a size the socket is not
+    /// running with, and the getter must report the kernel's answer rather than
+    /// the caller's request. The kernel clamps a request to `net.core.rmem_max`
+    /// on Linux (`net/core/sock.c:1375`) and to `kern.ipc.maxsockbuf` on macOS,
+    /// and stores a different value than it was asked for on both (`net/core/
+    /// sock.c:987` doubles the accepted value on Linux), so a getter that echoed
+    /// the request back — the shape a caller cannot detect — would pass a naive
+    /// "the setter took effect" check while the socket ran with something else.
+    ///
+    /// The properties asserted are therefore about disagreement, not equality:
+    /// a request above any host ceiling must read back **below** it, and a small
+    /// request must move the getter **off** the default. Both directions are
+    /// needed: an ignored setter fails the second, and a lying getter fails the
+    /// first.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_buffer_setters_report_what_the_kernel_accepted() {
+        let bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        let sock = UdpSocket::bind(bind).await.unwrap();
+        let default_recv = sock.recv_buffer_size().unwrap();
+        let default_send = sock.send_buffer_size().unwrap();
+        assert!(default_recv > 0, "a socket always has a receive buffer");
+        assert!(default_send > 0, "a socket always has a send buffer");
+
+        // A small request must move both getters off the default, so a setter
+        // that did nothing is caught.
+        sock.set_recv_buffer_size(1 << 16).unwrap();
+        sock.set_send_buffer_size(1 << 16).unwrap();
+        let small_recv = sock.recv_buffer_size().unwrap();
+        let small_send = sock.send_buffer_size().unwrap();
+        println!(
+            "BUFFER_SET default recv={default_recv} send={default_send}; after a 64KiB request \
+             recv={small_recv} send={small_send}"
+        );
+        assert_ne!(
+            small_recv, default_recv,
+            "a 64 KiB receive-buffer request left the socket at its {default_recv}B default: the \
+             setter did not reach the kernel"
+        );
+        assert_ne!(
+            small_send, default_send,
+            "a 64 KiB send-buffer request left the socket at its {default_send}B default: the \
+             setter did not reach the kernel"
+        );
+        assert!(
+            small_recv >= 1 << 16,
+            "the kernel accepted less than the 64 KiB requested ({small_recv}B), so this arm's \
+             premise does not hold on this host"
+        );
+
+        // A request far above any host ceiling must be clamped, and the getter
+        // must say so rather than echo the request.
+        const HUGE: usize = 1 << 30;
+        sock.set_recv_buffer_size(HUGE).unwrap();
+        sock.set_send_buffer_size(HUGE).unwrap();
+        let clamped_recv = sock.recv_buffer_size().unwrap();
+        let clamped_send = sock.send_buffer_size().unwrap();
+        println!(
+            "BUFFER_SET after a 1GiB request recv={clamped_recv} send={clamped_send} (requested \
+             {HUGE}); clamping happened on {}",
+            if clamped_recv < HUGE || clamped_send < HUGE {
+                "at least one direction"
+            } else {
+                "neither direction"
+            }
+        );
+        assert!(
+            clamped_recv > 0 && clamped_send > 0,
+            "a clamped buffer is still a buffer"
+        );
+        assert!(
+            clamped_recv < HUGE,
+            "the receive-buffer getter reported the 1 GiB request back ({clamped_recv}), so it \
+             echoes the request instead of reading the socket: a caller cannot tell a size that \
+             landed from one the kernel refused"
+        );
+        assert!(
+            clamped_send < HUGE,
+            "the send-buffer getter reported the 1 GiB request back ({clamped_send}), so it echoes \
+             the request instead of reading the socket"
+        );
     }
 
     /// `recv_buf` must advance the growable buffer by the number of bytes read,
