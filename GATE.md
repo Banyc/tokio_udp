@@ -114,13 +114,161 @@ floor** — a socket buffer never delays a datagram it accepts, it can only drop
 one — and the burst arm measures the shape: 9 000 datagrams of 1 200 B offered
 with no reader keep 638 at the default size and 3 404 once the receive buffer is
 set to 4 MiB. On Linux an unsized socket's receive queue comes from
-`net.core.rmem_default` (`SKB_TRUESIZE(256) * 256`, `net/core/sock.h:3056-3059`)
-and a datagram is dropped with `UDP_MIB_RCVBUFERRORS` once the truesize-accounted
-queue exceeds it (`net/core/sock.h:1153-1158`, `net/ipv4/udp.c:2310-2324`), so
-the ceiling prices offered *load* — the opposite mechanism to a floor. The
-buffer sizes are therefore left to the caller: the value that matters is a path
-bandwidth-delay product, which the transport that knows its own send rate owns
-and a socket layer does not.
+`net.core.rmem_default` — `SK_RMEM_DEFAULT = _SK_MEM_OVERHEAD * _SK_MEM_PACKETS`
+with `_SK_MEM_OVERHEAD = SKB_TRUESIZE(256)` (`include/net/sock.h:3056-3059`),
+212 992 B on x86_64 — and a datagram is refused once the truesize-accounted queue
+would exceed it (`net/ipv4/udp.c:1669-1679`), which is charged as
+`UDP_MIB_RCVBUFERRORS` (`net/ipv4/udp.c:2313-2316`), so the ceiling prices offered
+*load* — the opposite mechanism to a floor. The buffer sizes are therefore left to
+the caller: the value that matters is a path bandwidth-delay product, which the
+transport that knows its own send rate owns and a socket layer does not. The
+section below measures what that ceiling costs and gives the caller the surface
+to act on it.
+
+## The raw receive buffer: what the ceiling costs
+
+The arm above records that the default buffer is a *loss ceiling* rather than a
+floor. `tests/rcvbuf_cliff.rs` measures what that ceiling costs **at the rates
+this product offers** — the interactive lane's 256 B / 5 ms ≈ 51 KB/s and
+256 B / 25 ms ≈ 10 KB/s, and the bulk lane's 1 MiB/s, the rate the M3 arm offers.
+
+All four arms were measured with `cargo test --release --locked --offline --test
+rcvbuf_cliff -- --ignored --nocapture --test-threads=1` on the tree this file is
+committed with, at load averages **1.8–3.6 on 10 cores** (`uptime`).
+
+### A live reader drains every rate the product offers
+
+With the reader draining from the first millisecond, the default refuses nothing
+at any rate the product produces, at either product size (`OFFER_SWEEP` rows):
+
+| size | nominal rate | lane | offered | kept | refused | achieved |
+| --- | --- | --- | --- | --- | --- | --- |
+| 256 B | 10 KB/s | interactive 256 B / 25 ms | 12 | 12 | 0 | 10 240 B/s |
+| 256 B | 51.2 KB/s | interactive 256 B / 5 ms | 61 | 61 | 0 | 52 053 B/s |
+| 256 B | 1 MiB/s | bulk (M3) | 1 234 | 1 234 | 0 | 1 053 013 B/s |
+| 1 200 B | 51.2 KB/s | interactive 256 B / 5 ms | 13 | 13 | 0 | 52 000 B/s |
+| 1 200 B | 1 MiB/s | bulk (M3) | 262 | 262 | 0 | 1 048 000 B/s |
+
+The arm also reports 8 MiB/s and 64 MiB/s, both of which also lose nothing (9 878
+and 79 178 datagrams of 256 B offered, 2 111 and 16 738 of 1 200 B); they are
+reported and not asserted, because above 1 MiB/s the limiter on this host is the
+drain loop rather than the buffer and conflating the two would make the arm lie
+about which one moved. So the buffer is **not implicated at any offered rate the
+product produces while its reader is running** — a buffer is filled by the offer
+and emptied by the reader, and a reader that keeps up never lets it fill.
+
+### The cliff is a stall duration per lane, not a rate
+
+That is the whole shape of the mechanism: `rate x stall` is what the queue has to
+absorb, so the cliff is the stall duration at which the accumulation exceeds the
+budget. Measured at the bulk lane's 1 MiB/s against the `linux-default` budget
+(212 992 B), with the reader stalling and then draining:
+
+| datagrams accumulated in the stall | bytes | refused |
+| --- | --- | --- |
+| 166 (190 ms) | 199 KB | **0** |
+| 192 (220 ms) | 230 KB | **20** |
+| 437 (500 ms) | 524 KB | **264** |
+
+and against this host's own default (786 896 B) and a 4 MiB control, both
+refused **nothing** at every stall to 500 ms. At the **interactive** cadence the
+`linux-default` budget refused **nothing** at every stall the arm walks, up to
+500 ms — 102 datagrams of 256 B is 26 KB against a 208 KiB budget, an eightfold
+margin. So: the interactive lane is not implicated at any stall the field's
+190 ms floor can produce, and the bulk lane's cliff sits between 190 ms and
+220 ms of reader stall at the M3 arm's own offered rate. On this host's truesize
+accounting that is arithmetically 212 992 B / 1 200 B = **177 datagrams**, which
+at 873 datagrams/s is **203 ms**; on the deployed target's tighter accounting it
+is **~105–132 ms** (derived below). The field's floor is 190 ms. The cliff is *at*
+it here and *below* it there.
+
+### What a refusal costs
+
+`a_refused_datagram_costs_a_path_round_trip` stages a 190 ms round trip in
+userspace (two relays, one one-way delay each) and runs a bounded transfer over
+it, with the receive buffer the only place a datagram can be lost:
+
+| receive buffer | offered | arrived first pass | refused | completed |
+| --- | --- | --- | --- | --- |
+| 786 896 B (host default) | 699 | 699 | 0 | 297 ms (1.57 x RTT) |
+| 212 992 B (`linux-default`) | 699 | 463 | **236** | 490 ms (2.58 x RTT) |
+| 4 MiB (path BDP) | 699 | 699 | 0 | 297 ms (1.57 x RTT) |
+
+**Recovery cost = 490 ms - 297 ms = 193 ms = 1.01 x the path's round trip.** A
+refused datagram is not lost work, it is work deferred by one round trip, and on
+the field's path a transfer that has to recover 236 of 699 datagrams finishes in
+2.6 round trips where the same transfer against a sized buffer finishes in 1.6.
+That is the shape of the field's maxima: 1063 ms and 3205 ms are 5.6 and 16.9
+base round trips — multiples of the path, which is what a refusal recovered by a
+retransmission produces.
+
+### The kernel's bounds, read from the checkout
+
+* The doubling. `SO_RCVBUF` stores **twice** the accepted value, to account for
+the `skb` overhead charged to the receive queue:
+  `WRITE_ONCE(sk->sk_rcvbuf, max_t(int, val * 2, SOCK_MIN_RCVBUF))`,
+  `net/core/sock.c:987` (in `__sock_set_rcvbuf`, `:967`), with
+  `SOCK_MIN_RCVBUF = TCP_SKB_MIN_TRUESIZE` (`include/net/sock.h:2604`).
+* The `rmem_max` clamp. `SO_RCVBUF` is passed through
+  `min_t(u32, val, READ_ONCE(sysctl_rmem_max))`, `net/core/sock.c:1375` — above
+the sysctl the request is **silently** reduced, so the size a socket runs with is
+  `getsockopt(SO_RCVBUF)`'s answer (`v.val = READ_ONCE(sk->sk_rcvbuf)`,
+  `net/core/sock.c:1771-1773`) and never the argument that was passed.
+  `net.core.rmem_max` defaults to `4 << 20` (`net/core/sock.c:286`,
+  `Documentation/admin-guide/sysctl/net.rst:228`), and the default is settable
+  down to `SOCK_MIN_RCVBUF` (`net/core/sysctl_net_core.c:752-756`, `:36`).
+* The default. `sk->sk_rcvbuf = READ_ONCE(sysctl_rmem_default)`
+  (`net/core/sock.c:3707`) with `sysctl_rmem_default = SK_RMEM_DEFAULT`
+  (`net/core/sock.c:289`, `include/net/sock.h:3059`) = 212 992 B on x86_64.
+* The refusal. `if (rmem + size > rcvbuf) { ... goto drop; }` where
+  `rcvbuf = READ_ONCE(sk->sk_rcvbuf)` and `size = skb->truesize`,
+  `net/ipv4/udp.c:1669-1679`; the drop is charged `UDP_MIB_RCVBUFERRORS` and
+  `UDP_MIB_INERRORS` at `net/ipv4/udp.c:2313-2316` and counted per socket by
+  `numa_drop_add` (`:2319`). `sk->sk_rcvbuf` is quoted for the UDP forward
+  threshold at `net/ipv4/udp.c:2892`.
+
+The truesize accounting is why the Linux budget is the **tighter** one, and it is
+**derived rather than measured** here. On this host 212 992 B holds 172 datagrams
+of 1 200 B (`CAPACITY` row), i.e. it charges ~1 238 B per 1 200 B datagram — an
+upper bound on Linux's, because Linux charges `skb->truesize`, which is
+`ksize(head allocation) + SKB_DATA_ALIGN(sizeof(struct sk_buff))`
+(`net/core/skbuff.c:393-396`, with `SKB_TRUESIZE(X) = X +
+SKB_DATA_ALIGN(sizeof(struct sk_buff)) +
+SKB_DATA_ALIGN(sizeof(struct skb_shared_info))`, `include/linux/skbuff.h:273-275`)
+and so includes the slab-rounded head plus the `struct sk_buff` itself. The
+in-tree arithmetic for this exact budget is already on record — `wmem_default is
+212992 and overhead is 640 bytes per packet (256 skb, 64 headroom, 320 shared
+info)` (`drivers/net/ethernet/intel/ixgbe/ixgbe_main.c:2829-2831`) — which puts a
+1 200 B datagram at ~1 840 B and the budget at **~115 datagrams**, and slab
+rounding to the next allocation class (2 048 B of head plus a 256 B `sk_buff`)
+puts it at ~92. So the deployed receive budget holds **~92–115 datagrams** of
+1 200 B, or 110–138 KB of payload, against this host's measured 172, and the
+Linux cliff at the bulk lane's 873 datagrams/s is **~105–132 ms** of reader
+stall — *below* the field's 190 ms floor. Every depth measured in this file is an
+upper bound on the deployed target's, never a lower one.
+
+### The decision the measurement forces
+
+Both defaults are finite and both are smaller than the field path's bandwidth-delay
+product at any lane the product offers: at 1 MiB/s and a 190 ms round trip the
+product is 199 KB, against 110–138 KB of payload in the `linux-default` receive
+budget — the buffer cannot hold one round trip of the bulk lane, so a transfer
+above ~0.55–0.7 MiB/s on that path loses to the kernel whatever the link allows. The
+send side is the same shape: an unsized socket's send buffer bounds in-flight
+bytes at `wmem_default`, so on a 190 ms path it caps throughput at
+`212 992 / 190 ms ≈ 1.1 MB/s` independently of the receive side. **The size that
+matters is a path bandwidth-delay product, which this layer does not know** — it
+knows neither its path's round trip nor its transport's send rate — and the one
+lane the field's client actually runs is not implicated at all, since its own
+offered rate cannot fill the deployed budget in 500 ms of stall.
+
+Each arm prints its own rows and asserts its own sanity. The assertions are: no
+refusals at a live reader at the mandate rates; the default queue is finite and a
+4 MiB request buys depth (the "the size did not reach the socket" tripwire); the
+`linux-default` budget refuses nothing at the interactive cadence and the 4 MiB
+control refuses nothing at any stall; and the 4 MiB control needs no repair over
+the emulated path while the deployed budget does, and that repair costs at least
+half a round trip.
 
 ## Vacuity: the injections this gate is graded against
 
@@ -147,6 +295,10 @@ test silently re-ignored leaves the gate's own property unasserted.
 
 ```gate-manifest
 cancellation::cancelled_receive_soak_conserves_every_datagram = standard
+rcvbuf_cliff::a_live_reader_drains_every_rate_the_product_offers = full
+rcvbuf_cliff::the_receive_capacity_in_datagrams_at_the_product_sizes = full
+rcvbuf_cliff::a_reader_stall_is_what_overflows_the_receive_buffer = full
+rcvbuf_cliff::a_refused_datagram_costs_a_path_round_trip = full
 ```
 
 ```gate-default-required
@@ -170,6 +322,10 @@ cancellation::cancelled_receive_soak_conserves_every_datagram
 loopback_delay::tokio_udp_adds_no_floor_over_a_plain_std_udp_socket
 loopback_delay::the_socket_buffers_are_left_at_the_kernel_defaults
 loopback_delay::a_burst_past_the_default_receive_buffer_is_a_loss_ceiling_not_a_floor
+rcvbuf_cliff::a_live_reader_drains_every_rate_the_product_offers
+rcvbuf_cliff::the_receive_capacity_in_datagrams_at_the_product_sizes
+rcvbuf_cliff::a_reader_stall_is_what_overflows_the_receive_buffer
+rcvbuf_cliff::a_refused_datagram_costs_a_path_round_trip
 ```
 
 ## Perf declaration and coverage
@@ -186,6 +342,10 @@ cancellation::cancelled_receive_soak_conserves_every_datagram = standard | 0.25 
 loopback_delay::tokio_udp_adds_no_floor_over_a_plain_std_udp_socket = default | 0.10 | composite(path,shape,reference) | socket-floor@path=readiness+shape=ping-pong+reference=plain-std-udp
 loopback_delay::the_socket_buffers_are_left_at_the_kernel_defaults = default | 0.01 | composite(name,state) | socket-option@name=so_rcvbuf_and_so_sndbuf+state=unsized
 loopback_delay::a_burst_past_the_default_receive_buffer_is_a_loss_ceiling_not_a_floor = default | 0.15 | composite(path,load,size) | socket-loss@path=receive-queue+load=burst+size=default-vs-4MiB
+rcvbuf_cliff::a_live_reader_drains_every_rate_the_product_offers = full | 3.2 | composite(load,rate,size) | socket-offer@load=live-reader+rate=sweep+size=product
+rcvbuf_cliff::the_receive_capacity_in_datagrams_at_the_product_sizes = full | 2.2 | composite(name,state,size) | socket-capacity@name=so_rcvbuf+state=host-default-and-1MiB-and-4MiB-and-over-ceiling+size=product, socket-capacity@name=so_rcvbuf+state=linux-default+size=product
+rcvbuf_cliff::a_reader_stall_is_what_overflows_the_receive_buffer = full | 10.2 | composite(stall,size,rate,budget) | socket-stall@stall=sweep+size=product+rate=interactive-and-bulk+budget=host-default-and-linux-default-and-4MiB
+rcvbuf_cliff::a_refused_datagram_costs_a_path_round_trip = full | 1.5 | composite(path,rtt,budget) | socket-repair@path=emulated-190ms-rtt+rtt=field-floor+budget=linux-default-and-path-bdp
 ```
 
 The declared sums are `default` 0.32 s (0.06 s cancellation + 0.26 s loopback measurement, measured 0.10/0.01/0.15 s) and `standard` 0.25 s (measured 0.24 s at 300 cycles). The default tier of the *crate* grows by the ~0.26 s this measurement adds on top of an unchanged 0.58 s lib tier; the parked test's
@@ -215,6 +375,12 @@ cancellation-latch@tier=full = the soak is `standard`; the `full` budget is decl
 socket-floor@transport=impaired = this crate has no impairment instrument; loss, delay, reordering and rate shaping live in `netem_test` and the `rtp`/`rtp_mux` scenarios that compose this socket, not in a test that binds loopback directly.
 socket-floor@shape=pipelined = the floor arm keeps one datagram in flight so nothing can queue behind anything else; pipelining depths are measured in `udp_listener`'s dispatch sweep, which composes this socket.
 socket-loss@host=linux = the buffer sizes this arm reads are the host's, and the Linux default quoted above is read from the kernel source rather than measured on a Linux host, so the *magnitudes* of the two platforms' ceilings are not compared here.
+socket-offer@host=linux = `rcvbuf_cliff`'s live-reader sweep runs on macOS and measures this host's 786 896 B default, which is 3.7x the `linux-default` budget the deployed target gets; the `linux-default` rows in the stall and repair arms are the ones that stand in for it, and they too are measured on this host's truesize accounting, so a refusal here is one Linux would refuse and a non-refusal is not a clearance.
+socket-repair@stack=rtp = `rtp` was off limits for this measurement, so the repair is a bounded in-crate model — a gap report and a bulk second pass over the emulated path — and no repair ladder, RTO schedule, FEC scheme or congestion response of the composing transport is exercised. The mechanism (a refusal is recovered one round trip later) is measured; the transport's own recovery time is not.
+socket-stall@shape=consumer-stall = the stall is a reader that stops reading, which is the shape a scheduling stall or a busy consumer produces; it is not a network outage, and the arrival process at the receiver is loopback's, so this arm says nothing about reordering or an arrival pattern compressed by a bottleneck queue.
+socket-capacity@host=linux = the Linux depth is derived rather than measured; the derivation is stated with its arithmetic and its two citations in the section above, and every measured depth is an upper bound on it.
+socket-offer@lane=multiplexed = the sweep drives one socket, so several flows sharing one receiver is the composing transport's question and not a cell this crate can attribute.
+socket-repair@shape=consumer-stall = the refusal is staged by the reader's own stall on the emulated path, so this is a scheduling-stall shape rather than an arrival burst compressed by a bottleneck queue, and it says nothing about reordering.
 socket-floor@metric=syscall-count = macOS offers no unprivileged syscall tracer, so the syscall and copy counts are stated from the code paths and differenced by cost rather than counted per datagram.
 ```
 
