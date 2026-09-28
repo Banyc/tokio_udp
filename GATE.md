@@ -11,13 +11,12 @@ armed.
 
 This file is the authoritative scope of that gate. `cargo test -p tokio_udp`
 silently skips every `#[ignore]`d test, so the opt-in tier is named in the
-`gate-manifest` block below; the checker (`netem_test/tools/check-gate.py`,
+`gate-manifest` block below; the checker (`netem-tools check-gate`,
 per-crate mode) re-derives the set from the compiled test binary and fails when
-the manifest and reality disagree. Run it from the `netem_test` checkout, so it
-finds the shared tooling:
+the manifest and reality disagree. Run it from this crate's checkout:
 
 ```sh
-python3 ../netem_test/tools/check-gate.py \
+netem-tools check-gate \
   --crate . tokio_udp tests GATE.md
 ```
 
@@ -425,7 +424,7 @@ sets it, so it is invisible to every other block and the declaration below is
 its only record. The checker's `gate-env-tier` block enforces it in both
 directions — every variable the sources read must be declared, and every
 declared variable must be read — and refuses the `-` no-runner marker for a
-variable a script does set (`netem_test/tools/check-gate.py`). The row's
+variable a script does set (`netem-tools check-gate`). The row's
 `total` is **derived** from the surface's own variable
 (`TOKIO_UDP_SOAK_CYCLES*32`, the per-cycle datagram count being the fixed
 `SENDERS*PER_SENDER`) rather than restated beside it; its `wall` is
