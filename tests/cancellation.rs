@@ -639,7 +639,7 @@ async fn concurrent_cancelled_and_timed_out_receives_conserve_every_datagram() {
 /// Run it with the cycle count as the only knob:
 ///
 /// ```text
-/// CARGO_TARGET_DIR=/Users/charliesmith/code/tmp/it48_tokio_udp_target \
+/// CARGO_TARGET_DIR="$TMPDIR/it48_tokio_udp_target" \
 ///   cargo test --release -p tokio_udp --locked --offline \
 ///   --test cancellation -- --ignored --nocapture
 /// TOKIO_UDP_SOAK_CYCLES=5000 …   # default 300

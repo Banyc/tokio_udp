@@ -70,7 +70,7 @@ bounded: a cycle that never completes is counted, printed and fatal as a
 **standard** (`#[ignore]`d, asserting), declared below with its cost and cells.
 
 ```text
-CARGO_TARGET_DIR=/Users/charliesmith/code/tmp/it48_tokio_udp_target \
+CARGO_TARGET_DIR="$TMPDIR/it48_tokio_udp_target" \
   cargo test --release -p tokio_udp --locked --offline \
   --test cancellation -- --ignored --nocapture
 ```
